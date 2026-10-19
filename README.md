@@ -92,7 +92,7 @@ videos ─► 品質篩選 ─► 依本機 RAM 規劃 ─► 前處理（SHA、
 
 ## 驗證紀錄
 
-- 單元測試：`pytest tests/test_acam.py`（K 選擇、OOM 判斷、快取搬移、路徑範本、影片連通）。
+- 單元測試（55 個）：`PYTHONPATH=pipeline/src:pipeline/compat_src:. pytest tests pipeline/tests`（預算規劃、品質篩選判定、OOM 判斷、快取搬移、路徑範本、影片連通、引擎 direct mapping／EDM／CLI）。
 - 規模：Wulai 9 支影片、2043 關鍵影格，一次 GlueMap + EDM（`num_track_per_img=512`）→ 4,270,546 點、
   2019 個 MegaLoc 參考；holdout 位姿覆蓋率 96.35%（P0170017，獨立 session）/ 99.90%（P0230023，非獨立）。
 - 端到端冒煙：見 `SMOKE.md`。
