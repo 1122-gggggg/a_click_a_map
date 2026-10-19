@@ -48,7 +48,8 @@ def render_gluemap_config(paths: Paths, tracks: int, out: Path) -> Path:
     return out
 
 
-def map_argv(paths: Paths, job: MapJob, config: Path, *, preprocess_only: bool = False) -> list[str]:
+def map_argv(paths: Paths, job: MapJob, config: Path, *, preprocess_only: bool = False,
+             sampling_scale: float = 1.0) -> list[str]:
     argv = [
         str(paths.python), "-m", "sfm_diagnosis.site_pipeline.cli", "map",
         "--site-name", job.site,
@@ -66,6 +67,9 @@ def map_argv(paths: Paths, job: MapJob, config: Path, *, preprocess_only: bool =
     ]
     if preprocess_only:
         argv.append("--preprocess-only")
+    if sampling_scale != 1.0:  # thin the adaptive keyframe sampling (engine defaults: 1.0 / 2.0 / 0.2 / 2.0 fps)
+        argv += ["--baseline-fps", f"{1.0 * sampling_scale:.3f}", "--fast-fps", f"{2.0 * sampling_scale:.3f}",
+                 "--hover-fps", f"{0.2 * sampling_scale:.3f}", "--rotation-fps", f"{2.0 * sampling_scale:.3f}"]
     return argv
 
 
@@ -218,20 +222,46 @@ def keyframe_count(run: Path) -> int:
     return int(receipt["keyframes"])
 
 
-def preprocess(paths: Paths, job: MapJob, tracks: int) -> int:
+def reset_run(job: MapJob) -> None:
+    """Forget a preprocessing result (the keyframe set is about to change)."""
+
+    for path in (job.run, job.workspace):
+        if path.exists():
+            shutil.rmtree(path)
+
+
+def preprocess(paths: Paths, job: MapJob, tracks: int, scale: float = 1.0) -> int:
     """Hash sources, extract adaptive keyframes; returns the keyframe count. Idempotent."""
 
     if not (job.run / "receipts/direct_preprocessing.json").is_file():
         config = render_gluemap_config(paths, tracks, job.meta / f"gluemap_config_k{tracks}.json")
-        rc, text, _ = run_logged(map_argv(paths, job, config, preprocess_only=True), env=engine_env(paths),
-                                 log=job.meta / "logs/mapping.log", trace=job.meta / "logs/memory.csv",
-                                 label="preprocess", use_scope=False, mem_max=0, swap_max=0)
+        rc, text, _ = run_logged(map_argv(paths, job, config, preprocess_only=True, sampling_scale=scale),
+                                 env=engine_env(paths), log=job.meta / "logs/mapping.log",
+                                 trace=job.meta / "logs/memory.csv", label="preprocess", use_scope=False,
+                                 mem_max=0, swap_max=0)
         if rc != 0:
             raise RuntimeError(f"preprocessing failed (rc={rc}); see {job.meta / 'logs/mapping.log'}\n{text[-1500:]}")
     return keyframe_count(job.run)
 
 
-def run_map(paths: Paths, job: MapJob, *, tracks: int, max_attempts: int = 3) -> dict:
+def weak_sources(run: Path, *, min_keyframes: int = 8, max_removed: float = 0.5) -> dict[str, str]:
+    """Videos the engine's own frame analysis found unusable: {source file name: reason}."""
+
+    receipt = json.loads((run / "receipts/direct_preprocessing.json").read_text(encoding="utf-8"))
+    manifest = json.loads((run / "inputs/corpus_manifest.json").read_text(encoding="utf-8"))
+    name_of = {row.get("video_id"): Path(str(row["path"])).name for row in manifest.get("sources", ())}
+    weak: dict[str, str] = {}
+    for row in receipt["per_source"]:
+        name = name_of.get(row["video_id"], row["video_id"])
+        analyzed = max(int(row["analyzed_frames"]), 1)
+        if int(row["keyframes"]) < min_keyframes:
+            weak[name] = f"only {row['keyframes']} usable keyframes"
+        elif int(row["removed_frames"]) / analyzed > max_removed:
+            weak[name] = f"{int(row['removed_frames'])}/{analyzed} analysed frames discarded as garbage"
+    return weak
+
+
+def run_map(paths: Paths, job: MapJob, *, tracks: int, scale: float = 1.0, max_attempts: int = 3) -> dict:
     """Run mapping to completion (after `preprocess`), lowering K after OOM kills."""
 
     env = engine_env(paths)
@@ -245,12 +275,15 @@ def run_map(paths: Paths, job: MapJob, *, tracks: int, max_attempts: int = 3) ->
     history: list[dict] = []
     config = render_gluemap_config(paths, tracks, meta / f"gluemap_config_k{tracks}.json")
     for attempt in range(1, max_attempts + 1):
-        rc, text, stats = run_logged(map_argv(paths, job, config), env=env, log=log, trace=trace,
+        rc, text, stats = run_logged(map_argv(paths, job, config, sampling_scale=scale), env=env, log=log, trace=trace,
                                      label=f"map{attempt}", use_scope=use_scope, mem_max=mem_max, swap_max=swap_max)
         history.append({"attempt": attempt, "num_track_per_img": tracks, "returncode": rc,
                         "peak_gib": round(stats["peak_gib"], 1), "oom_kills": stats["oom_kills"]})
         if rc == 0 and finished(job.run):
             return {"num_track_per_img": tracks, "attempts": history}
+        if rc != 0 and plan.is_cuda_oom(text):  # lowering host-RAM settings does not fix this
+            raise RuntimeError(f"GPU out of memory (this pipeline peaked at ~12 GiB VRAM on 2000 keyframes); "
+                               f"need a larger GPU or a smaller corpus. See {log}")
         oom = plan.is_oom_exit(rc, text) or stats["oom_kills"] > 0
         lower = plan.reduce_tracks(tracks) if oom else None
         if lower is None or attempt == max_attempts:
@@ -260,7 +293,7 @@ def run_map(paths: Paths, job: MapJob, *, tracks: int, max_attempts: int = 3) ->
         print(f"  OOM at num_track_per_img={tracks}; retrying with {lower}", flush=True)
         old = work_dirs(job.workspace)
         config = render_gluemap_config(paths, lower, meta / f"gluemap_config_k{lower}.json")
-        new = prime_workspace(map_argv(paths, job, config), env, job.workspace, old)
+        new = prime_workspace(map_argv(paths, job, config, sampling_scale=scale), env, job.workspace, old)
         if new is not None and old:
             newest = max(old, key=lambda p: (p / "gluemap/twoview_result.pth").stat().st_mtime
                          if (p / "gluemap/twoview_result.pth").exists() else 0)

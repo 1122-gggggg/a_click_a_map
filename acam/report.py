@@ -76,20 +76,29 @@ def build_report(run: Path, min_shared: int = 50) -> dict:
     }
 
 
-def to_markdown(report: dict, name: str, mapping: dict) -> str:
+def to_markdown(report: dict, name: str, mapping: dict, *, screening: dict | None = None,
+                excluded: dict | None = None) -> str:
     lines = [f"# Map report: {name}", "",
              f"- status: `{report['receipt_status']}` (no external ground truth; native map units, not metres)",
              f"- registered images: {report['images_registered']} / {report['images_total']}",
              f"- EDM 3D points: {report['points3D']:,}; MegaLoc references: {report['megaloc_references']}",
-             f"- num_track_per_img used: {mapping['num_track_per_img']}; attempts: {len(mapping['attempts'])}",
+             f"- num_track_per_img used: {mapping['num_track_per_img']}; keyframe sampling x{mapping.get('sampling_scale', 1.0)}; "
+             f"attempts: {len(mapping['attempts'])}",
              f"- videos connected through shared points (>= {report['video_pairs_min_shared']}): "
              f"**{'yes' if report['connected'] else 'NO'}**", ""]
     if not report["connected"]:
         lines += ["> WARNING: the videos form separate components; they may not share one coordinate frame.", ""]
         lines += [f"> - component: {', '.join(c)}" for c in report["video_components"]] + [""]
-    lines += ["| video | source | keyframes | registered | pose-only |", "|---|---|---:|---:|---:|"]
+    lines += ["| video | source | keyframes | registered | pose-only | screening |", "|---|---|---:|---:|---:|---|"]
     for video, row in report["videos"].items():
-        lines.append(f"| {video} | {row['source']} | {row['keyframes']} | {row['registered']} | {row['pose_only']} |")
+        verdict = (screening or {}).get(row["source"], {})
+        note = verdict.get("verdict", "")
+        if verdict.get("reasons"):
+            note += ": " + "; ".join(verdict["reasons"])
+        lines.append(f"| {video} | {row['source']} | {row['keyframes']} | {row['registered']} | {row['pose_only']} | {note} |")
+    if excluded:
+        lines += ["", "Excluded from this run:", ""]
+        lines += [f"- `{file}`: {why}" for file, why in sorted(excluded.items())]
     lines += ["", "Attempts:", ""]
     lines += [f"- #{a['attempt']}: K={a['num_track_per_img']} rc={a['returncode']} peak={a['peak_gib']} GiB" for a in mapping["attempts"]]
     return "\n".join(lines) + "\n"

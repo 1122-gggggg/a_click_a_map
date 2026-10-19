@@ -28,3 +28,24 @@ What this does and does not show:
 - The OOM retry path (`runner.run_map` lowering `num_track_per_img` and moving caches) is covered by unit tests of its
   parts (`transplant_caches`, `reduce_tracks`, `is_oom_exit`) but was **not** triggered in this smoke test.
 - Run-to-run counts differ by a few frames (GPU nondeterminism).
+
+
+## Second smoke test: bad videos and a small memory cap (2026-10-19)
+
+Corpus of 9 files: three good 40 s clips (2688x1512) plus six deliberately bad ones made with ffmpeg
+(`blur` sigma 15, `dark`, `static` single frame, `tiny` 320x180, `truncated` 2 MB, `mixed30` = 14 s good + 6 s blur),
+run with `--max-keyframes 60` to force the memory-budget path on a machine that could hold far more.
+
+| step | result |
+|---|---|
+| screening (49 s with 4 workers) | REJECT blur, dark, tiny, truncated; WARN mixed30 (29% poor), static (static camera); OK the 3 clips |
+| budget | cap 60 keyframes -> sampling x0.50, 2 more videos dropped for memory (`clip_c`, `static`), 3 of 9 used |
+| preprocessing | 56 keyframes (estimate 58) |
+| mapping | 1 attempt, rc 0, 6 min; 56/56 registered, 149,235 points, the 3 videos connected |
+| report | lists every excluded file with its reason; per-video screening verdict in the table |
+| localize (query 65-85 s, inside the map) | 98.54% (427 FAST_TRACK, 45 RELOC_SEED, 7 NO_POSE) from only 56 keyframes |
+
+Also verified separately: the 11 real Wulai videos all screen OK; the engine refuses symlinked sources, so the
+staged corpus uses hard links (copies only if `--out` is on another filesystem). A first version used symlinks and
+failed on that rule; fixed. Not verified: the post-preprocess re-extraction loop (`rescale_after_preprocess`,
+`weak_sources` exclusion) end to end; both have unit tests only.
