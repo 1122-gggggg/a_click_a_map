@@ -1,0 +1,8 @@
+Third-party code is NOT vendored except where stated:
+- pipeline/ is the MIT-licensed normal_map_pipeline source (sfm_diagnosis, sfm_qa, ...) plus
+  river_map_quality compatibility modules.
+- patches/gluemap.patch modifies colmap/gluemap (BSD-3), patches/edm.patch modifies chicleee/EDM
+  (Apache-2.0). `scripts/setup.sh` clones the upstream repositories at pinned commits and applies
+  the patches; check each upstream license before redistributing derived trees.
+- Model weights (Pi3, SALAD, VGGSfM, Doppelgangers++, MegaLoc, EDM) are downloaded or supplied by
+  the user and are subject to their own licenses.

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profile": "graph_aware_v3_validated_20260827",
+  "policy": "Weights are not redistributed. Download from the upstream project and verify SHA256 before use.",
+  "sources": {
+    "gluemap": {
+      "repository": "https://github.com/colmap/gluemap",
+      "commit": "adc9e4bb5f41014d3f7c157a879edc278588c829",
+      "checkpoints": {
+        "checkpoint-dg+visym.pth": "480b92bda771cabd7be6e8c756b986784118361e3f1ff1489d5bf49ac6382300",
+        "pi3.safetensors": "33580e4702ac671558aedeab1148fd08118f7ce45bdbeb99f3e3cf340062875d",
+        "dino_salad.ckpt": "6b3f1720954293e83da6966c5cfcfc6713200d7fefadcca76fc51aeb80b3cada",
+        "vggsfm_v2_0_0_track_predictor.bin": "451f1d218be1ef661c81d6254cbc633a5190e7d6069fe51621cc29ba5d90a404"
+      }
+    },
+    "edm": {
+      "repository": "https://github.com/chicleee/EDM",
+      "commit": "8a31d81d3babc6a9d73e4a3b6f8ba88b0281b3c7",
+      "checkpoint": "weights/edm_outdoor.ckpt",
+      "sha256": "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
+    },
+    "megaloc": {
+      "repository": "https://github.com/gmberton/MegaLoc",
+      "huggingface_snapshot": "gberton/MegaLoc@37bb43d65dd6388d1578052de5eb0bcdceb497e7",
+      "checkpoint": "model.safetensors",
+      "sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
+    },
+    "actloc_optional_not_used_in_validated_runs": {
+      "repository": "https://github.com/cvg/ActLoc",
+      "verified_interface_commit": "8614dc4a9c470736871d24cf92dde8f8e7f45cf9"
+    }
+  }
+}

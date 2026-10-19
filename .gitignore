@@ -1,0 +1,7 @@
+third_party/
+acam_out/
+acam.toml
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/

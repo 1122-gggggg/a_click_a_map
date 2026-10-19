@@ -1,0 +1,2660 @@
+diff --git a/gluemap/controllers/augmented_bundle_adjustment.py b/gluemap/controllers/augmented_bundle_adjustment.py
+index b745295..26fd99a 100644
+--- a/gluemap/controllers/augmented_bundle_adjustment.py
++++ b/gluemap/controllers/augmented_bundle_adjustment.py
+@@ -242,6 +242,12 @@ class IterativeBAOptions:
+     # Whether to filter virtual points same as real tracks
+     filter_virtual_points: bool = True
+ 
++    # Whether BA may refine camera intrinsics. False (default) holds them FIXED
++    # at their seeded values. True is only for a self-calibration measurement
++    # pass -- a production map must never ship with unvalidated floating
++    # intrinsics.
++    refine_intrinsics: bool = False
++
+ 
+ def prune_track_outliers(
+     points3D: dict[int, pycolmap.Point3D],
+@@ -548,6 +554,7 @@ def iterative_bundle_adjustment(
+             virtual_reconstruction,
+             negative_depth_observations,
+             max_num_iterations=options.max_ba_iterations,
++            refine_intrinsics=options.refine_intrinsics,
+         )
+ 
+         # Inner loop: filter and tighten threshold when too few tracks filtered
+diff --git a/gluemap/controllers/global_refinement.py b/gluemap/controllers/global_refinement.py
+index f5bb3b3..b53a557 100644
+--- a/gluemap/controllers/global_refinement.py
++++ b/gluemap/controllers/global_refinement.py
+@@ -369,8 +369,9 @@ def run_refinement_pipeline(
+         max_ba_iterations=200,
+         max_filter_iterations=3,
+         normalized_reproj_threshold=1e-2,
+-        min_track_length=2,
++        min_track_length=getattr(args, "min_track_length", 2),
+         fix_rotations_first_pass=False,
++        refine_intrinsics=getattr(args, "refine_intrinsics", False),
+     )
+ 
+     # Step 5: Build reconstruction from current data
+diff --git a/gluemap/controllers/gluemap_impl.py b/gluemap/controllers/gluemap_impl.py
+index 26a7798..5ba053d 100644
+--- a/gluemap/controllers/gluemap_impl.py
++++ b/gluemap/controllers/gluemap_impl.py
+@@ -310,7 +310,10 @@ class GluemapPipeline:
+         timing["sift_database"] = time.perf_counter() - t0
+ 
+         t0 = time.perf_counter()
+-        track_snapping = TrackSnapping(snapping_thres=1.0)
++        track_snapping = TrackSnapping(
++            snapping_thres=1.0,
++            require_sift=getattr(args, "chosen_tracker", "vggsfm") == "romav2",
++        )
+         track_snapping.main(
+             args.curr_path + "/database_sift.db",
+             predictions_dict,
+diff --git a/gluemap/controllers/image_retrieval.py b/gluemap/controllers/image_retrieval.py
+index cd6c671..37017b3 100644
+--- a/gluemap/controllers/image_retrieval.py
++++ b/gluemap/controllers/image_retrieval.py
+@@ -3,10 +3,15 @@ import logging
+ import os
+ import time
+ 
++import cv2
++import numpy as np
+ import torch
+ from tqdm import tqdm
+ 
+-from gluemap.datasets.utils import get_image_list
++from gluemap.datasets.utils import (
++    get_image_list,
++    get_retrieval_descriptor_filename,
++)
+ from gluemap.utils.gpu import synchronize
+ from gluemap.utils.load_fn import load_and_preprocess_images
+ from gluemap.utils.model_loader import load_models
+@@ -14,8 +19,8 @@ from gluemap.utils.model_loader import load_models
+ logger = logging.getLogger(__name__)
+ 
+ 
+-class SaladRetrievalPipeline:
+-    """Pipeline object for SALAD-based image retrieval.
++class ImageRetrievalPipeline:
++    """Pipeline object for SALAD- or MegaLoc-based image retrieval.
+ 
+     Computes a global descriptor per image and caches it to disk. Follows the
+     same pattern as the other pipeline classes: stable config is stored as
+@@ -27,7 +32,7 @@ class SaladRetrievalPipeline:
+         args: argparse.Namespace,
+         world_size: int,
+         rank: int,
+-        file_name: str = "salad_descriptors.pt",
++        file_name: str | None = None,
+         device: str = "cuda",
+         dtype: torch.dtype = torch.bfloat16,
+         models: dict[str, torch.nn.Module] | None = None,
+@@ -35,7 +40,8 @@ class SaladRetrievalPipeline:
+         self.args = args
+         self.world_size = world_size
+         self.rank = rank
+-        self.file_name = file_name
++        self.retrieval_key = getattr(args, "chosen_retrieval", "salad")
++        self.file_name = file_name or get_retrieval_descriptor_filename(args)
+         self.device = device
+         self.dtype = dtype
+         self.preloaded_models = models
+@@ -49,19 +55,21 @@ class SaladRetrievalPipeline:
+         t0 = time.perf_counter()
+         if (
+             self.preloaded_models is not None
+-            and "salad" in self.preloaded_models
++            and self.preloaded_models.get(self.retrieval_key) is not None
+         ):
+-            self.model = self.preloaded_models["salad"]
++            self.model = self.preloaded_models[self.retrieval_key]
+             self.device = next(self.model.parameters()).device
+         else:
+-            loaded, self.device = load_models(self.args, keys={"salad"})
+-            self.model = loaded["salad"]
++            loaded, self.device = load_models(
++                self.args, keys={self.retrieval_key}
++            )
++            self.model = loaded[self.retrieval_key]
+             self._owns_model = True
+         self.model_loading_time = time.perf_counter() - t0
+         return self.model
+ 
+     def _release_model(self) -> None:
+-        """Free the SALAD model if we own it (i.e. not caller-supplied)."""
++        """Free the retrieval model if we own it (i.e. not caller-supplied)."""
+         if not self._owns_model or self.model is None:
+             return
+         del self.model
+@@ -80,24 +88,70 @@ class SaladRetrievalPipeline:
+             os.remove(path)
+             logger.info(f"[rerun_from=retrieval] Deleted {path}")
+ 
++    def _load_megaloc_images(
++        self,
++        image_paths: list[str],
++        mean: torch.Tensor,
++        std: torch.Tensor,
++    ) -> torch.Tensor:
++        """Use native RGB pixels and the established local MegaLoc transform."""
++        images = []
++        for path in image_paths:
++            image = cv2.imread(path, cv2.IMREAD_COLOR)
++            if image is None:
++                raise FileNotFoundError(path)
++            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
++            row = (
++                torch.from_numpy(np.ascontiguousarray(image))
++                .permute(2, 0, 1)
++                .float()
++                .div_(255.0)
++            )
++            row = torch.nn.functional.interpolate(
++                row.unsqueeze(0),
++                size=(322, 322),
++                mode="bilinear",
++                align_corners=False,
++                antialias=True,
++            ).squeeze(0)
++            images.append((row - mean) / std)
++        return torch.stack(images)
++
+     @torch.no_grad()
+     def _compute_descriptors(self) -> torch.Tensor:
+-        """Compute SALAD descriptors for every image under args.images_path."""
++        """Compute selected retrieval descriptors in sorted image order."""
+         model = self._load_model()
+         batch_size = self.args.retrieval_batch_size
+         images_list = get_image_list(self.args.images_path)
++        if self.retrieval_key == "megaloc":
++            mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
++            std = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
+ 
+         descriptors = []
+         N = len(images_list)
+         for i in tqdm(range(0, N, batch_size)):
+             num_img = min(N - i, batch_size)
+-            images, _, _ = load_and_preprocess_images(
+-                images_list[i : i + num_img],
+-                image_size=322,  # use the fixed 322 size for SALAD retrieval
+-                patch_size=14,
+-                force_square=True,
+-            )
+-            output = model(images.to(self.device)).cpu()
++            image_paths = images_list[i : i + num_img]
++            if self.retrieval_key == "megaloc":
++                images = self._load_megaloc_images(image_paths, mean, std)
++            else:
++                images, _, _ = load_and_preprocess_images(
++                    image_paths,
++                    image_size=322,  # fixed 322 size for SALAD retrieval
++                    patch_size=14,
++                    force_square=True,
++                )
++            output = model(images.to(self.device)).float().cpu()
++            if self.retrieval_key == "megaloc":
++                if output.shape != (num_img, 8448):
++                    raise ValueError(
++                        f"MegaLoc descriptor shape {tuple(output.shape)} "
++                        f"does not match ({num_img}, 8448)"
++                    )
++                norms = output.norm(dim=1, keepdim=True)
++                if not torch.isfinite(output).all() or (norms <= 1e-12).any():
++                    raise ValueError("MegaLoc emitted invalid descriptors")
++                output = output / norms
+             descriptors.append(output)
+ 
+         descriptors = torch.cat(descriptors)
+@@ -115,7 +169,7 @@ class SaladRetrievalPipeline:
+             os.path.join(base_path, file_name)
+         ):
+             if self.rank == 0:
+-                logger.info("Computing SALAD descriptors...")
++                logger.info(f"Computing {self.retrieval_key} descriptors...")
+                 descriptors = self._compute_descriptors()
+ 
+                 os.makedirs(base_path, exist_ok=True)
+@@ -131,7 +185,7 @@ class SaladRetrievalPipeline:
+ 
+         Returns:
+             ``((models_dict, device), timing)`` — ``models_dict`` maps
+-            ``"salad"`` to the loaded model (or ``None`` if it was released)
++            the selected retrieval key to the model (or ``None`` if released)
+             and ``timing`` contains ``model_loading``, ``image_retrieval`` and
+             ``total`` seconds.
+         """
+@@ -158,7 +212,7 @@ class SaladRetrievalPipeline:
+             )
+ 
+         self._release_model()
+-        return ({"salad": self.model}, self.device), timing
++        return ({self.retrieval_key: self.model}, self.device), timing
+ 
+     def run_multi(
+         self, datasets: list[str]
+@@ -214,18 +268,18 @@ class SaladRetrievalPipeline:
+             )
+ 
+         self._release_model()
+-        return ({"salad": self.model}, self.device), timing
++        return ({self.retrieval_key: self.model}, self.device), timing
+ 
+ 
+ def run_preprocessing_pipeline(
+     args: argparse.Namespace,
+     world_size: int,
+     rank: int,
+-    file_name: str = "salad_descriptors.pt",
++    file_name: str | None = None,
+     models: dict[str, torch.nn.Module] | None = None,
+ ):
+-    """Instantiate ``SaladRetrievalPipeline`` and run it on one collection."""
+-    pipeline = SaladRetrievalPipeline(
++    """Run selected image retrieval on one collection."""
++    pipeline = ImageRetrievalPipeline(
+         args, world_size, rank, file_name, models=models
+     )
+     return pipeline.run()
+@@ -236,11 +290,11 @@ def run_preprocessing_pipeline_multi(
+     world_size: int,
+     rank: int,
+     datasets: list[str],
+-    file_name: str = "salad_descriptors.pt",
++    file_name: str | None = None,
+     models: dict[str, torch.nn.Module] | None = None,
+ ):
+-    """Instantiate ``SaladRetrievalPipeline`` and run across sub-datasets."""
+-    pipeline = SaladRetrievalPipeline(
++    """Run selected image retrieval across sub-datasets."""
++    pipeline = ImageRetrievalPipeline(
+         args, world_size, rank, file_name, models=models
+     )
+     return pipeline.run_multi(datasets)
+diff --git a/gluemap/controllers/star_inference.py b/gluemap/controllers/star_inference.py
+index 9485675..551f26d 100644
+--- a/gluemap/controllers/star_inference.py
++++ b/gluemap/controllers/star_inference.py
+@@ -9,7 +9,9 @@ import torch
+ from gluemap.controllers.base_inference import BaseInferencePipeline
+ from gluemap.datasets.star import BaseStarDataset
+ from gluemap.estimators.covisibility_extraction import CovisibilityExtraction
++from gluemap.estimators.roma_track_inference import RoMaTrackInference
+ from gluemap.estimators.track_inference import TrackInference
++from gluemap.estimators.track_snapping import TrackSnapping
+ from gluemap.ff_inference.local_inference import create_local_inference
+ from gluemap.utils.model_loader import load_models
+ 
+@@ -31,6 +33,12 @@ class BatchInferenceStar:
+         model_track: torch.nn.Module | None = None,
+         device: str = "cuda",
+         dtype: torch.dtype = torch.bfloat16,
++        tracker_type: str = "vggsfm",
++        roma_max_matches: int = 1024,
++        roma_center_radius: float = 1.0,
++        depth_confidence_quantile: float = 0.5,
++        sift_snap_database: str = "",
++        sift_image_root: str = "",
+     ):
+         self.model = model
+         self.model_type = model_type
+@@ -39,10 +47,30 @@ class BatchInferenceStar:
+         self.dtype = dtype
+ 
+         self.local_inference = create_local_inference(
+-            model, model_type, device, dtype
++            model,
++            model_type,
++            device,
++            dtype,
++            confidence_quantile=depth_confidence_quantile,
+         )
+-        self.track_inference = TrackInference(model_track, device)
+-        self.covisibility_extraction = CovisibilityExtraction()
++        if tracker_type == "romav2":
++            self.track_inference = RoMaTrackInference(
++                model_track,
++                device,
++                max_matches=roma_max_matches,
++                center_radius=roma_center_radius,
++            )
++        elif tracker_type == "vggsfm":
++            self.track_inference = TrackInference(model_track, device)
++        else:
++            raise ValueError(f"Unsupported point tracker: {tracker_type}")
++        self.covisibility_extraction = CovisibilityExtraction(
++            virtual_stride=16 if model_type == "vggt_omega" else 14
++        )
++        self.sift_snapper = None
++        if tracker_type == "romav2" and sift_snap_database:
++            self.sift_snapper = TrackSnapping(snapping_thres=1.0, require_sift=True)
++            self.sift_snapper.load_sift_keypoints(sift_snap_database, sift_image_root)
+ 
+     def main(
+         self,
+@@ -57,7 +85,7 @@ class BatchInferenceStar:
+                 making up the star) and ``"images_change"`` (per-image
+                 image-shape rescale info).
+             use_dummy_tracks: If ``True``, emit dummy tracks (query points
+-                expanded over frames) instead of running the VGGSfM tracker;
++                expanded over frames) instead of running the selected tracker;
+                 track outputs are still kept in the result dict (must combine
+                 with ``include_track=True``).
+             include_track: If ``True``, include ``"tracks"``, ``"vis"`` and
+@@ -87,6 +115,12 @@ class BatchInferenceStar:
+             batch["indexes"],
+             batch["images_change"],
+         )
++        # Apply the required SIFT gate before dense star tensors enter the
++        # accumulated CPU outputs/cache. The sampled edge cap is unchanged.
++        if include_track and not use_dummy_tracks and self.sift_snapper is not None:
++            t0 = time.perf_counter()
++            predictions.update(self.sift_snapper.snap_single_output(predictions, batch))
++            track_time += time.perf_counter() - t0
+ 
+         result_dict = {
+             "indexes": batch["indexes"][0].tolist(),
+@@ -172,19 +206,20 @@ class StarInferencePipeline(BaseInferencePipeline):
+ 
+     def _load_models(self) -> dict[str, torch.nn.Module]:
+         chosen_model = getattr(self.args, "chosen_model", "pi3")
++        chosen_tracker = getattr(self.args, "chosen_tracker", "vggsfm")
++        model_keys = (
++            {chosen_model}
++            if getattr(self.args, "use_dummy_tracks", False)
++            else {chosen_model, chosen_tracker}
++        )
+         if self.models is not None:
+             return self.models
+         if (
+             self.preloaded_models is not None
+-            and chosen_model in self.preloaded_models
++            and model_keys.issubset(self.preloaded_models)
+         ):
+             self.models = self.preloaded_models
+             return self.models
+-        model_keys = (
+-            {chosen_model}
+-            if getattr(self.args, "use_dummy_tracks", False)
+-            else {chosen_model, "vggsfm"}
+-        )
+         models, self.device = load_models(self.args, keys=model_keys)
+         self.models = models
+         self._owns_models = True
+@@ -197,9 +232,17 @@ class StarInferencePipeline(BaseInferencePipeline):
+         return BatchInferenceStar(
+             models[chosen_model],
+             chosen_model,
+-            models.get("vggsfm"),
++            models.get(getattr(self.args, "chosen_tracker", "vggsfm")),
+             device=self.device,
+             dtype=self.dtype,
++            tracker_type=getattr(self.args, "chosen_tracker", "vggsfm"),
++            roma_max_matches=getattr(self.args, "roma_max_matches", 1024),
++            roma_center_radius=getattr(self.args, "roma_center_radius", 1.0),
++            depth_confidence_quantile=getattr(
++                self.args, "depth_confidence_quantile", 0.5
++            ),
++            sift_snap_database=getattr(self.args, "sift_snap_database", ""),
++            sift_image_root=getattr(self.args, "images_path", ""),
+         )
+ 
+     def _run_batch_step(
+diff --git a/gluemap/datasets/multi_sequence_twoview.py b/gluemap/datasets/multi_sequence_twoview.py
+index 1c0be07..ca8887a 100644
+--- a/gluemap/datasets/multi_sequence_twoview.py
++++ b/gluemap/datasets/multi_sequence_twoview.py
+@@ -1,6 +1,7 @@
+ import argparse
+ import logging
+ import os
++from pathlib import Path
+ from typing import Any
+ 
+ import numpy as np
+@@ -10,6 +11,7 @@ from gluemap.datasets.base import DemoBaseDataset
+ from gluemap.datasets.utils import (
+     establish_neighbors_sequential,
+     get_image_list,
++    get_retrieval_descriptor_filename,
+     retrieve_global_neighbors,
+ )
+ 
+@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
+ class MultiSequencePairs(DemoBaseDataset):
+     """Two-view dataset spanning several sequence subfolders.
+ 
+-    Each sequence has its own SALAD descriptors and sequential
++    Each sequence has its own retrieval descriptors and sequential
+     neighborhood; pairs are then merged across sequences via a global
+     FAISS retrieval over the concatenated descriptor bank.
+     """
+@@ -40,7 +42,7 @@ class MultiSequencePairs(DemoBaseDataset):
+ 
+         super().__init__(args, patch_size=16)
+ 
+-        # Load all the images, and generate SALAD descriptors for matching
++        # Discover images in descriptor extraction order.
+         img_list = []
+         for dataset in self.datasets:
+             img_list.extend(
+@@ -48,8 +50,9 @@ class MultiSequencePairs(DemoBaseDataset):
+             )
+ 
+         # Now, use all the images in the folder
++        root = Path(self.images_path_root)
+         self.images_list = [
+-            x.replace(self.images_path_root, "").strip("/") for x in img_list
++            Path(name).relative_to(root).as_posix() for name in img_list
+         ]
+ 
+         self.images_path = [
+@@ -102,7 +105,7 @@ class MultiSequencePairs(DemoBaseDataset):
+     ) -> None:
+         """Populate ``self.pairs`` with intra- and inter-sequence pairs.
+ 
+-        Per sequence: load SALAD descriptors and build the local
++        Per sequence: load retrieval descriptors and build the local
+         sequential window (offsetting indices into the combined image
+         index space). Across sequences: feed the per-sequence neighbor
+         tensors and descriptor banks into
+@@ -127,7 +130,7 @@ class MultiSequencePairs(DemoBaseDataset):
+         for dataset in datasets:
+             logger.info(f"Constructing pairs for dataset: {dataset}")
+ 
+-            # For each subfolder, load SALAD descriptors and construct
++            # For each subfolder, load retrieval descriptors and construct
+             # sequential pairs
+             img_list_dataset = [
+                 x
+@@ -171,6 +174,85 @@ class MultiSequencePairs(DemoBaseDataset):
+             args, neighbors_sequential, descriptors_all
+         )
+ 
++        self.pairs = self._inject_extra_pairs(args, self.pairs)
++
++    def _inject_extra_pairs(
++        self,
++        args: argparse.Namespace,
++        pairs: np.ndarray,
++    ) -> np.ndarray:
++        """Union forced pairs from ``args.extra_pairs_path`` into ``pairs``.
++
++        Global descriptors cannot retrieve a forward<->reverse match: the two
++        traversals of a corridor look nothing alike, so VPR never proposes the
++        pair and the two sequences can never be linked. This lets a caller force
++        those pairs in as CANDIDATES; two-view geometry and Doppelgangers still
++        decide whether any of them survive.
++
++        The file holds one ``nameA nameB`` per line, names relative to
++        ``images_path`` and matching ``self.images_list`` entries exactly. An
++        unmatched name is a hard error: a silently dropped bridge is precisely
++        the failure this option exists to prevent.
++
++        Args:
++            args: Namespace; reads optional ``extra_pairs_path``.
++            pairs: (N, 2) undirected unique pairs from retrieval.
++
++        Returns:
++            (M, 2) int64 array, ``i < j``, deduplicated.
++        """
++        path = getattr(args, "extra_pairs_path", None)
++        if not path:
++            return pairs
++
++        index_of = {
++            Path(name).as_posix(): i
++            for i, name in enumerate(self.images_list)
++        }
++        forced, missing = [], []
++        with open(path) as f:
++            for lineno, line in enumerate(f, 1):
++                line = line.strip()
++                if not line or line.startswith("#"):
++                    continue
++                parts = line.split()
++                if len(parts) != 2:
++                    raise ValueError(
++                        f"{path}:{lineno}: expected 'nameA nameB', got {line!r}"
++                    )
++                a, b = (Path(name).as_posix() for name in parts)
++                if a not in index_of or b not in index_of:
++                    missing.append((lineno, a if a not in index_of else b))
++                    continue
++                i, j = index_of[a], index_of[b]
++                if i != j:
++                    forced.append((min(i, j), max(i, j)))
++
++        if missing:
++            preview = ", ".join(f"line {n}: {nm!r}" for n, nm in missing[:5])
++            raise ValueError(
++                f"{path}: {len(missing)} pair endpoint(s) not in the image "
++                "list "
++                f"({preview}). Names must be relative to images_path."
++            )
++
++        if not forced:
++            logger.warning(f"extra_pairs_path {path} yielded no usable pairs")
++            return pairs
++
++        forced_arr = np.asarray(sorted(set(forced)), dtype=np.int64)
++        before = len(pairs)
++        merged = np.unique(
++            np.concatenate([np.asarray(pairs, dtype=np.int64), forced_arr]),
++            axis=0,
++        )
++        logger.info(
++            f"Forced pairs: {len(forced_arr)} from {path}, "
++            f"{len(merged) - before} new after dedup "
++            f"(retrieval {before} -> total {len(merged)})"
++        )
++        return merged
++
+     def _retrieve_descriptors_and_neighbors(
+         self,
+         args: argparse.Namespace,
+@@ -190,19 +272,18 @@ class MultiSequencePairs(DemoBaseDataset):
+             ``(neighbors, descriptors_db)``. ``neighbors`` is the
+             ``(N, K + 1)`` long tensor from
+             :func:`establish_neighbors_sequential`. ``descriptors_db``
+-            is the cached SALAD descriptor tensor or ``None`` when the
+-            file is absent.
++            is the selected cached retrieval descriptor tensor.
+         """
+         descriptors_path = os.path.join(
+-            args.curr_processed, dataset, "salad_descriptors.pt"
++            args.curr_processed, dataset, get_retrieval_descriptor_filename(args)
+         )
+ 
+         # TODO: add subsampling logic here if necessary
+         if os.path.exists(descriptors_path):
+-            descriptors_db = torch.load(descriptors_path, weights_only=False)
++            descriptors_db = torch.load(descriptors_path, weights_only=True)
+         else:
+             raise FileNotFoundError(
+-                f"SALAD descriptors not found at {descriptors_path}. "
++                f"Retrieval descriptors not found at {descriptors_path}. "
+                 "Run multi-sequence preprocessing first, or set "
+                 "rerun_from: retrieval to regenerate descriptor caches."
+             )
+diff --git a/gluemap/datasets/sequential_twoview.py b/gluemap/datasets/sequential_twoview.py
+index bd6b5c0..37b543c 100644
+--- a/gluemap/datasets/sequential_twoview.py
++++ b/gluemap/datasets/sequential_twoview.py
+@@ -6,6 +6,7 @@ import torch
+ from gluemap.datasets.twoview import BaseTwoViewDataset
+ from gluemap.datasets.utils import (
+     establish_neighbors_sequential,
++    get_retrieval_descriptor_filename,
+     retrieve_global_neighbors,
+ )
+ 
+@@ -46,7 +47,7 @@ class SequentialTwoViewDataset(BaseTwoViewDataset):
+     ) -> None:
+         """Populate ``self.pairs`` and ``self.sequential_edges``.
+ 
+-        Loads cached SALAD descriptors (required — no fallback), builds
++        Loads selected retrieval descriptors (required — no fallback), builds
+         a sequential window via :func:`establish_neighbors_sequential`,
+         merges with FAISS global retrieval via
+         :func:`retrieve_global_neighbors`, and records the immediate
+@@ -61,14 +62,14 @@ class SequentialTwoViewDataset(BaseTwoViewDataset):
+                 sequential descriptor lookup keys off ``self.images_list``.
+ 
+         Raises:
+-            FileNotFoundError: If ``salad_descriptors.pt`` is missing.
++            FileNotFoundError: If the selected descriptor cache is missing.
+         """
+         descriptors_path = os.path.join(
+-            args.curr_processed, "salad_descriptors.pt"
++            args.curr_processed, get_retrieval_descriptor_filename(args)
+         )
+ 
+         if os.path.exists(descriptors_path):
+-            descriptors_db = torch.load(descriptors_path, weights_only=False)
++            descriptors_db = torch.load(descriptors_path, weights_only=True)
+             # find the corresponding images and only keep the short list
+             image_indexes = [
+                 img_list.index(os.path.join(args.images_path, img))
+@@ -78,15 +79,15 @@ class SequentialTwoViewDataset(BaseTwoViewDataset):
+ 
+         else:
+             raise FileNotFoundError(
+-                f"SALAD descriptors not found at {descriptors_path}. "
+-                "Please run SALAD descriptor extraction first."
++                f"Retrieval descriptors not found at {descriptors_path}. "
++                "Please run selected retrieval descriptor extraction first."
+             )
+ 
+         neighbors = establish_neighbors_sequential(
+             self.images_list, num_neighbors=args.num_neighbors_sequential
+         )  # N, num_neighbors + 1
+ 
+-        # retrieve global neighbors based on SALAD descriptors
++        # Retrieve global neighbors based on selected retrieval descriptors.
+         self.pairs = retrieve_global_neighbors(
+             args, [neighbors], [descriptors_db]
+         )
+diff --git a/gluemap/datasets/star.py b/gluemap/datasets/star.py
+index 963b2fc..f305e78 100644
+--- a/gluemap/datasets/star.py
++++ b/gluemap/datasets/star.py
+@@ -35,8 +35,9 @@ class BaseStarDataset(DemoBaseDataset):
+             args: Parsed CLI/config namespace. Reads optional
+                 ``num_track_per_img`` (default ``1024``).
+         """
+-        self.image_size = 518
+-        self.patch_size = 14
++        is_omega = getattr(args, "chosen_model", "pi3") == "vggt_omega"
++        self.image_size = 512 if is_omega else 518
++        self.patch_size = 16 if is_omega else 14
+ 
+         self.num_tracks = (
+             args.num_track_per_img
+@@ -257,23 +258,21 @@ class BaseStarDataset(DemoBaseDataset):
+ 
+         # calculate the image_changes
+         if self.force_square:
+-            new_shape_hw = (518, 518)
++            new_shape_hw = (self.image_size, self.image_size)
+         else:
+             # find the shape
+             ori_shape = self.images_shape_ori[0]
+             height, width = ori_shape
+ 
+             if width > height:
+-                new_width = 518
++                new_width = self.image_size
+ 
+-                # Calculate height maintaining aspect ratio, divisible by 14
+-                new_height = round(height * (new_width / width))
++                new_height = round(height * new_width / width / self.patch_size) * self.patch_size
+ 
+             else:
+-                new_height = 518
++                new_height = self.image_size
+ 
+-                # Calculate width maintaining aspect ratio, divisible by 14
+-                new_width = round(width * (new_height / height))
++                new_width = round(width * new_height / height / self.patch_size) * self.patch_size
+ 
+             new_shape_hw = (new_height, new_width)
+ 
+diff --git a/gluemap/datasets/twoview.py b/gluemap/datasets/twoview.py
+index d7727d3..9a28efb 100644
+--- a/gluemap/datasets/twoview.py
++++ b/gluemap/datasets/twoview.py
+@@ -8,7 +8,10 @@ import numpy as np
+ import torch
+ 
+ from gluemap.datasets.base import DemoBaseDataset
+-from gluemap.datasets.utils import get_image_list
++from gluemap.datasets.utils import (
++    get_image_list,
++    get_retrieval_descriptor_filename,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -17,7 +20,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+     """Two-view dataset that yields image pairs for pairwise inference.
+ 
+     Discovers images under ``args.images_path``, optionally filters to a
+-    user-supplied list, builds candidate pairs from cached SALAD
++    user-supplied list, builds candidate pairs from cached retrieval
+     descriptors (or falls back to exhaustive matching), and exposes the
+     pairs as PyTorch-style ``(images, ...)`` items.
+     """
+@@ -32,7 +35,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+         """
+         super().__init__(args, patch_size=16)
+ 
+-        # Load all the images, and generate SALAD descriptors for matching
++        # Discover images in descriptor extraction order.
+         img_list_full, img_list_used = self._get_image_list(args)
+ 
+         # Now, use all the images in the folder
+@@ -48,7 +51,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+             args.images_path for _ in range(len(self.images_list))
+         ]
+ 
+-        # if salad descriptors are available, use them to construct pairs,
++        # If retrieval descriptors are available, use them to construct pairs,
+         # else, use exhaustive matching
+         self._construct_pairs(args, img_list_full)
+ 
+@@ -136,8 +139,8 @@ class BaseTwoViewDataset(DemoBaseDataset):
+     ) -> None:
+         """Populate ``self.pairs`` with undirected unique pair indices.
+ 
+-        Uses a FAISS L2 search over cached SALAD descriptors at
+-        ``args.curr_processed/salad_descriptors.pt`` when available and
++        Uses a FAISS L2 search over the selected retrieval descriptor cache in
++        ``args.curr_processed`` when available and
+         the descriptor count is large enough. Otherwise falls back to
+         exhaustive matching.
+ 
+@@ -148,10 +151,8 @@ class BaseTwoViewDataset(DemoBaseDataset):
+                 preprocessing — used to map current ``self.images_list``
+                 entries back to descriptor rows.
+         """
+-        # TODO: extract the SALAD descriptors on the fly
+-
+         descriptors_path = os.path.join(
+-            args.curr_processed, "salad_descriptors.pt"
++            args.curr_processed, get_retrieval_descriptor_filename(args)
+         )
+         # args.num_neighbors = 100
+ 
+@@ -161,7 +162,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+             os.path.exists(descriptors_path)
+             and len(self.images_list) > args.num_neighbors
+         ):
+-            descriptors_db = torch.load(descriptors_path, weights_only=False)
++            descriptors_db = torch.load(descriptors_path, weights_only=True)
+             # find the corresponding images and only keep the short list
+             image_indexes = [
+                 img_list.index(os.path.join(args.images_path, img))
+diff --git a/gluemap/datasets/utils.py b/gluemap/datasets/utils.py
+index 7bf66be..22c1d5d 100644
+--- a/gluemap/datasets/utils.py
++++ b/gluemap/datasets/utils.py
+@@ -10,6 +10,14 @@ import torch
+ logger = logging.getLogger(__name__)
+ 
+ 
++def get_retrieval_descriptor_filename(args: argparse.Namespace) -> str:
++    """Select the descriptor cache for the configured retrieval model."""
++    retrieval = getattr(args, "chosen_retrieval", "salad")
++    if retrieval not in {"salad", "megaloc"}:
++        raise ValueError(f"Unsupported retrieval model: {retrieval}")
++    return f"{retrieval}_descriptors.pt"
++
++
+ def get_image_list(images_path: str) -> list[str]:
+     """List image files under ``images_path`` recursively, sorted by path.
+ 
+diff --git a/gluemap/estimators/augmented_bundle_adjustment.py b/gluemap/estimators/augmented_bundle_adjustment.py
+index 4980380..f9183b0 100644
+--- a/gluemap/estimators/augmented_bundle_adjustment.py
++++ b/gluemap/estimators/augmented_bundle_adjustment.py
+@@ -174,6 +174,12 @@ def _add_virtual_track_residuals(
+             cam_pose = reference_reconstruction.frames[
+                 ref_id
+             ].rig_from_world.params
++            # pycolmap omits poses without real observations. Register these
++            # virtual-only poses on SE(3), not as unconstrained 7D vectors.
++            # Leave existing manifolds intact, including the scale anchor.
++            if not problem.has_parameter_block(cam_pose):
++                problem.add_parameter_block(cam_pose, 7)
++                pygluemap.set_pose_manifold(problem, cam_pose)
+             camera_params = reference_reconstruction.cameras[camera_id].params
+             active_model_id = reference_reconstruction.cameras[camera_id].model
+ 
+@@ -210,6 +216,7 @@ def bundle_adjustment(
+     max_num_iterations: int = 200,
+     loss_type_normal: str = "huber",
+     loss_type_virtual: str = "arctan",
++    refine_intrinsics: bool = False,
+ ) -> tuple[
+     pycolmap.Reconstruction,
+     pycolmap.Reconstruction | None,
+@@ -238,6 +245,9 @@ def bundle_adjustment(
+             ``"trivial"``, ``"huber"``, ``"cauchy"``.
+         loss_type_virtual: Loss function for virtual tracks. One of
+             ``"trivial"``, ``"huber"``, ``"arctan"``, ``"cauchy"``.
++        refine_intrinsics: When False (default), camera intrinsics are held
++            FIXED at their seeded values. When True, BA is free to refine
++            them -- only for a deliberate self-calibration measurement pass.
+ 
+     Returns:
+         (reconstruction, virtual_reconstruction, summary) with parameters
+@@ -261,11 +271,22 @@ def bundle_adjustment(
+     ba_options.ceres.auto_select_solver_type = True
+     ba_options.ceres.loss_function_type = _pycolmap_loss_type(loss_type_normal)
+ 
++    # pycolmap defaults are refine_focal_length=True and refine_extra_params=True.
++    # Setting refine_focal_length alone is NOT enough -- extra_params (k1, ...)
++    # would still drift. All three must be False for COLMAP to mark the whole
++    # camera params block constant instead of attaching a SubsetManifold.
++    ba_options.refine_focal_length = refine_intrinsics
++    ba_options.refine_principal_point = refine_intrinsics
++    ba_options.refine_extra_params = refine_intrinsics
++
+     ba_config = pycolmap.BundleAdjustmentConfig()
+     for image_id in reconstruction.images:
+         ba_config.add_image(image_id)
+     for point3D_id in reconstruction.points3D:
+         ba_config.add_variable_point(point3D_id)
++    if not refine_intrinsics:
++        for camera_id in reconstruction.cameras:
++            ba_config.set_constant_cam_intrinsics(camera_id)
+     ba_config.fix_gauge(pycolmap.BundleAdjustmentGauge.TWO_CAMS_FROM_WORLD)
+ 
+     bundle_adjuster = pycolmap.create_default_ceres_bundle_adjuster(
+@@ -273,6 +294,27 @@ def bundle_adjustment(
+     )
+     problem = bundle_adjuster.problem
+ 
++    # Constancy is decided at adjuster-construction time, so assert it here
++    # rather than trusting the options round-trip. Virtual residuals added later
++    # cannot un-constant the block (Ceres preserves SetParameterBlockConstant).
++    if not refine_intrinsics:
++        for camera_id in reconstruction.cameras:
++            params = reconstruction.cameras[camera_id].params
++            if not problem.has_parameter_block(params):
++                continue
++            if not problem.is_parameter_block_constant(params):
++                raise RuntimeError(
++                    f"camera {camera_id} intrinsics are NOT constant despite "
++                    "refine_intrinsics=False -- fixed-intrinsics BA is broken"
++                )
++        logger.info(
++            f"Intrinsics FIXED for {len(reconstruction.cameras)} camera(s)"
++        )
++    else:
++        logger.warning(
++            "Intrinsics are FREE to refine (self-calibration measurement pass)"
++        )
++
+     logger.info(
+         f"After pycolmap BA construction: "
+         f"{problem.num_residual_blocks()} residual blocks, "
+@@ -298,9 +340,25 @@ def bundle_adjustment(
+ 
+     # --- Solve -------------------------------------------------------------
+     solver_options = ba_options.ceres.create_solver_options(ba_config, problem)
++    if (
++        num_virtual > 0
++        and solver_options.linear_solver_type
++        == pyceres.LinearSolverType.ITERATIVE_SCHUR
++    ):
++        # The real-track size heuristic selects iterative Schur for large
++        # maps, but mixed virtual constraints can make its linear solve fail.
++        # Factor the same Schur system directly; do not drop virtual tracks or
++        # increase invalid-step retries. Small/pure-real solver choices stay.
++        solver_options.linear_solver_type = pyceres.LinearSolverType.SPARSE_SCHUR
++        logger.info("Using direct sparse Schur for augmented bundle adjustment")
+     summary = pyceres.SolverSummary()
+     pygluemap.solve_cuda(solver_options, problem, summary)
+     logger.info(summary.BriefReport())
++    if summary.termination_type in (
++        pyceres.TerminationType.FAILURE,
++        pyceres.TerminationType.USER_FAILURE,
++    ):
++        raise RuntimeError(f"Augmented bundle adjustment failed: {summary.FullReport()}")
+ 
+     # --- Sync poses/intrinsics into the virtual reconstruction -------------
+     # Only the real reconstruction's numpy buffers flowed into the ceres
+diff --git a/gluemap/estimators/covisibility_extraction.py b/gluemap/estimators/covisibility_extraction.py
+index 25f0704..1e35d9a 100644
+--- a/gluemap/estimators/covisibility_extraction.py
++++ b/gluemap/estimators/covisibility_extraction.py
+@@ -63,9 +63,11 @@ class CovisibilityExtraction:
+         self,
+         check_consistency: bool = False,
+         include_track: bool = True,
++        virtual_stride: int = 14,
+     ) -> None:
+         self.check_consistency = check_consistency
+         self.include_track = include_track
++        self.virtual_stride = virtual_stride
+ 
+     def main(
+         self,
+@@ -107,17 +109,12 @@ class CovisibilityExtraction:
+             predictions["depth"], extrinsics, intrinsics
+         )
+ 
+-        if self.check_consistency:
+-            scores, valid_mask = self._verify_by_reprojection_n2(
+-                depth_transformed,
+-                extrinsics,
+-                intrinsics,
+-                conf=predictions["depth_conf"],
+-            )
+-        else:
+-            scores, valid_mask = self._verify_by_reprojection_n2(
+-                depth_transformed, extrinsics, intrinsics
+-            )
++        scores, valid_mask = self._verify_by_reprojection_n2(
++            depth_transformed,
++            extrinsics,
++            intrinsics,
++            depth_valid_mask=predictions.get("depth_valid_mask"),
++        )
+ 
+         tracks_virtual, points3d_virtual, isnegative_virtual, valid_virtual = (
+             self._calculate_virtual_tracks(
+@@ -170,6 +167,8 @@ class CovisibilityExtraction:
+         # Use the valid to obtain a distribution of the depth
+         # Assuming the first image has the identity matrix
+         B, N, H, W, _ = depth.shape
++        stride = self.virtual_stride
++        offset = stride // 2
+ 
+         valid_depth_mask = valid_mask[:, 1:].float().sum(dim=1) > 0  # (B, H, W)
+         median_depth = []
+@@ -194,7 +193,7 @@ class CovisibilityExtraction:
+ 
+         # Then, sample the depth on a coarser grid
+         grid_x, grid_y = torch.meshgrid(
+-            torch.arange(0, W // 14), torch.arange(0, H // 14), indexing="xy"
++            torch.arange(0, W // stride), torch.arange(0, H // stride), indexing="xy"
+         )
+         grids_coarse = (
+             torch.stack((grid_x, grid_y), dim=-1)
+@@ -202,8 +201,8 @@ class CovisibilityExtraction:
+             .to(depth.device)
+             .unsqueeze(0)
+             .expand(B, -1, -1, -1)
+-            * 14
+-            + 7
++            * stride
++            + offset
+         )  # (H, W, 2)
+ 
+         # For each grid point, check whether the depth is valid.
+@@ -211,7 +210,7 @@ class CovisibilityExtraction:
+         image_rays = unproject(
+             einops.rearrange(grids_coarse, "b h w d -> b (h w) d"),
+             einops.rearrange(intrinsic[:, 0], "b d c -> b d c"),
+-        ).reshape(B, H // 14, W // 14, 3)  # (B, H, W, 3)
++        ).reshape(B, H // stride, W // stride, 3)
+ 
+         world_points = torch.einsum(
+             "b h w d, b d c -> b h w c",
+@@ -222,7 +221,7 @@ class CovisibilityExtraction:
+         ori_depth = torch.where(
+             valid_depth_mask, depth[:, 0][..., 0], median_depth
+         ).unsqueeze(-1)  # (B, H, W, 1)
+-        selected_depth = ori_depth[:, 7::14, 7::14]
++        selected_depth = ori_depth[:, offset:H // stride * stride:stride, offset:W // stride * stride:stride]
+         # Add noise to the depth with 10% of the current depth as the noise
+         noise = torch.randn_like(selected_depth) * 0.1 * selected_depth
+         sampled_depth = selected_depth + noise
+@@ -471,6 +470,7 @@ class CovisibilityExtraction:
+         return_seperate_scores: bool = False,
+         images_change: torch.Tensor | None = None,
+         images_shape_ori: torch.Tensor | None = None,
++        depth_valid_mask: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """
+         Score reference-frame consistency via round-trip reprojection error.
+@@ -549,7 +549,29 @@ class CovisibilityExtraction:
+         )
+ 
+         valid = (errors_i < threshold_reproj) * (~invalid_j2i)
+-        scores = valid.flatten(-2, -1).sum(dim=-1) / valid_number
++        if depth_valid_mask is not None:
++            # Require confident depth in both views at the forward projection.
++            target_points = torch.einsum(
++                "b h w c, b n d c -> b n h w d",
++                world_points[:, 0],
++                extrinsics[:, :, :3, :3],
++            ) + extrinsics[:, :, :3, 3].unsqueeze(2).unsqueeze(3)
++            target_pixels = project(
++                target_points.reshape(B * N, H * W, 3),
++                intrinsic.reshape(B * N, 3, 3),
++            ).reshape(B * N, H, W, 2)
++            grid = target_pixels.clone()
++            grid[..., 0] = (grid[..., 0] + 0.5) * (2.0 / W) - 1
++            grid[..., 1] = (grid[..., 1] + 0.5) * (2.0 / H) - 1
++            target_valid = torch.nn.functional.grid_sample(
++                depth_valid_mask.reshape(B * N, 1, H, W).float(),
++                grid,
++                mode="nearest",
++                padding_mode="zeros",
++                align_corners=False,
++            ).reshape(B, N, H, W) > 0.5
++            valid = valid & depth_valid_mask[:, :1] & target_valid
++        scores = valid.flatten(-2, -1).sum(dim=-1) / torch.as_tensor(valid_number, device=valid.device).clamp_min(1)
+ 
+         return scores, valid
+ 
+@@ -563,6 +585,7 @@ class CovisibilityExtraction:
+         lambda_conf: float = 0.05,
+         images_change: torch.Tensor | None = None,
+         images_shape_ori: torch.Tensor | None = None,
++        depth_valid_mask: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """
+         N^2 covisibility scoring across every pair of views.
+@@ -595,6 +618,8 @@ class CovisibilityExtraction:
+             world_points, extrinsics, intrinsic = _switch_tensor_order(
+                 [world_points, extrinsics, intrinsic], order
+             )
++            if depth_valid_mask is not None:
++                depth_valid_mask = depth_valid_mask.index_select(1, order)
+ 
+             if images_change is not None:
+                 images_change, images_shape_ori = _switch_tensor_order(
+@@ -611,12 +636,15 @@ class CovisibilityExtraction:
+                 False,
+                 images_change,
+                 images_shape_ori,
++                depth_valid_mask,
+             )
+ 
+             # swap back the order of the indexes
+             world_points, extrinsics, intrinsic, scores = _switch_tensor_order(
+                 [world_points, extrinsics, intrinsic, scores], order
+             )
++            if depth_valid_mask is not None:
++                depth_valid_mask = depth_valid_mask.index_select(1, order)
+ 
+             if images_change is not None:
+                 images_change, images_shape_ori = _switch_tensor_order(
+@@ -648,6 +676,7 @@ class CovisibilityExtraction:
+ 
+             # Construct the graph
+             G = nx.Graph()
++            G.add_nodes_from(range(N))
+             G.add_weighted_edges_from(list(valid_edges))
+ 
+             # Get the shortest distance between every nodes to the center
+diff --git a/gluemap/estimators/track_snapping.py b/gluemap/estimators/track_snapping.py
+index e100af0..e2f689c 100644
+--- a/gluemap/estimators/track_snapping.py
++++ b/gluemap/estimators/track_snapping.py
+@@ -1,4 +1,5 @@
+ import logging
++import sqlite3
+ from pathlib import Path
+ 
+ import faiss
+@@ -7,12 +8,104 @@ import pycolmap
+ import torch
+ from tqdm import tqdm
+ 
++from gluemap.math.scaling import rescale_tracks_single, standardize_query_points
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class TrackSnapping:
+-    def __init__(self, snapping_thres: float = 1.0) -> None:
++    def __init__(
++        self, snapping_thres: float = 1.0, require_sift: bool = False
++    ) -> None:
+         self.snapping_thres = snapping_thres
++        self.require_sift = require_sift
++        self._sift_keypoints: dict[str, torch.Tensor] | None = None
++        self._sift_indexes: dict[str, faiss.IndexFlatL2] | None = None
++        self._sift_image_root: Path | None = None
++
++    def load_sift_keypoints(
++        self, database_dir: str | Path, image_root: str | Path
++    ) -> None:
++        """Cache only authoritative SIFT XY from a strictly read-only database.
++
++        No matches, camera parameters, descriptors, or geometry are read.
++        Image names remain the database's relative names under ``image_root``.
++        This cache lets each star pass the required SIFT gate before it is
++        accumulated in memory or written to the inference cache.
++        """
++        if not self.require_sift:
++            raise ValueError("Early keypoint snapping requires strict SIFT mode")
++        if not image_root:
++            raise ValueError("A SIFT image root is required for database name mapping")
++        keypoints = {}
++        indexes = {}
++        database = sqlite3.connect(
++            Path(database_dir).resolve().as_uri() + "?mode=ro&immutable=1", uri=True
++        )
++        try:
++            rows = database.execute(
++                "SELECT images.name, keypoints.rows, keypoints.cols, keypoints.data "
++                "FROM images LEFT JOIN keypoints USING (image_id)"
++            )
++            for name, num_points, num_columns, data in rows:
++                if num_points is None:
++                    raise ValueError(f"Missing SIFT keypoints for database image {name!r}")
++                if num_points == 0:
++                    coordinates = np.empty((0, 2), dtype=np.float32)
++                else:
++                    coordinates = np.frombuffer(data or b"", dtype=np.float32).reshape(
++                        num_points, num_columns
++                    )[:, :2].copy()
++                keypoints[name] = torch.from_numpy(coordinates).unsqueeze(0)
++                index = faiss.IndexFlatL2(2)
++                index.add(coordinates)
++                indexes[name] = index
++        finally:
++            database.close()
++        self._sift_keypoints = keypoints
++        self._sift_indexes = indexes
++        self._sift_image_root = Path(image_root).absolute()
++        logger.info("Cached read-only SIFT keypoints for %d images", len(keypoints))
++
++    def snap_single_output(self, predictions: dict, batch: dict) -> dict:
++        """Strictly snap one star, returning compact tracks in its input canvas.
++
++        This uses the same consolidation as the downstream original-domain
++        snapping, so repeating that gate against the same SIFT points is
++        idempotent. Visibility/confidence and missing-view semantics survive
++        compaction; dense matches are still sampled at the configured cap.
++        """
++        if self._sift_keypoints is None:
++            raise ValueError("SIFT keypoints must be loaded before early snapping")
++        tracks = predictions["track"].detach().cpu()
++        if tracks.shape[0] != 1:
++            raise ValueError("Early SIFT snapping expects a single star batch")
++        num_frames = tracks.shape[1]
++        names = [
++            Path(batch["image_paths"][frame][0]).absolute()
++            .relative_to(self._sift_image_root).as_posix()
++            for frame in range(num_frames)
++        ]
++        query_points = [self._sift_keypoints[name] for name in names]
++        search_indexes = [self._sift_indexes[name] for name in names]
++        for frame in range(num_frames):
++            rescale_tracks_single(tracks[0, frame], batch["images_change"][0][frame])
++        local = {
++            "indexes": [list(range(num_frames))],
++            "tracks": [tracks],
++            "vis": [predictions["vis"].detach().cpu()],
++            "conf": [predictions["conf"].detach().cpu()],
++        }
++        self._snap_tracks(
++            local, query_points, self.snapping_thres,
++            search_indexes=search_indexes, show_progress=False,
++        )
++        compact = local["tracks"][0]
++        for frame in range(num_frames):
++            standardize_query_points(
++                compact[0, frame], batch["images_change"][0][frame]
++            )
++        return {"track": compact, "vis": local["vis"][0], "conf": local["conf"][0]}
+ 
+     def main(
+         self,
+@@ -24,16 +117,18 @@ class TrackSnapping:
+         """
+         Snap predicted tracks to the nearest keypoints in the COLMAP database.
+ 
+-        Loads keypoints from the COLMAP database at ``database_dir``, scales the
+-        per-image snapping threshold to original image resolution, and rewrites
+-        ``predictions_dict`` in-place via :meth:`_snap_tracks`.
++        Loads keypoints from the COLMAP database at ``database_dir`` and
++        rewrites ``predictions_dict`` in-place via :meth:`_snap_tracks`.
++        With ``require_sift=True``, the threshold is in original-image pixels
++        and unmatched observations are discarded. Otherwise the historical
++        1024-canvas threshold scaling and score halving are preserved.
+ 
+         Args:
+             database_dir: Path to the COLMAP database holding image keypoints.
+             predictions_dict: Tracks dictionary produced by upstream inference;
+                 modified in place.
+             images_shape_ori: Per-image (H, W) of the original images, used to
+-                rescale ``self.snapping_thres`` from the 1024-px tracker space.
++                rescale the threshold only when ``require_sift=False``.
+             images_list: Image filenames in the same order as
+                 ``images_shape_ori``; resolved against database image names.
+         """
+@@ -61,8 +156,8 @@ class TrackSnapping:
+             scaling_factor = (
+                 images_shape_ori[image_idx][0] + images_shape_ori[image_idx][1]
+             ) / 1024
+-            snapping_thres_dict[image_idx] = (
+-                self.snapping_thres * scaling_factor
++            snapping_thres_dict[image_idx] = self.snapping_thres * (
++                1.0 if self.require_sift else scaling_factor
+             )
+ 
+         logger.info("Start track snapping")
+@@ -75,15 +170,19 @@ class TrackSnapping:
+         predictions_dict: dict,
+         query_points_full: list[torch.Tensor],
+         snapping_thres: float | dict[int, float],
++        search_indexes: list[faiss.IndexFlatL2] | None = None,
++        show_progress: bool = True,
+     ) -> None:
+         """
+         Snap each predicted track to its nearest database keypoint per image.
+ 
+         Builds an FAISS L2 index per image, finds the closest database keypoint
+         to every track observation, and overwrites positions whose squared
+-        distance is below the per-image threshold. Observations that are not
+-        snapped have their visibility score halved. Mutates ``predictions_dict``
+-        in-place by adding the ``"scores"`` and ``"is_close"`` entries.
++        distance is within the per-image threshold. In the historical mode,
++        unsnapped observations have their visibility score halved. In strict
++        SIFT mode they are discarded, and tracks are consolidated by center
++        SIFT keypoint with one-to-one neighbor associations. Mutates
++        ``predictions_dict`` in-place, including ``"scores"`` and ``"is_close"``.
+ 
+         Args:
+             predictions_dict: Track dictionary with ``"indexes"``,
+@@ -112,11 +211,13 @@ class TrackSnapping:
+         else:
+             snapping_thres_dict = snapping_thres
+ 
+-        indexes_all = []
+-        for idx in range(N):
+-            index = faiss.IndexFlatL2(2)
+-            index.add(query_points_full[idx][0])
+-            indexes_all.append(index)
++        indexes_all = search_indexes
++        if indexes_all is None:
++            indexes_all = []
++            for idx in range(N):
++                index = faiss.IndexFlatL2(2)
++                index.add(query_points_full[idx][0])
++                indexes_all.append(index)
+ 
+         counter = 0
+         for key in snapping_thres_dict:
+@@ -125,22 +226,43 @@ class TrackSnapping:
+         indexes = range(len(predictions_dict["indexes"]))
+         counter_valid = 0
+         predictions_dict["is_close"] = {}
+-        logger.info("Indexing and snapping points...")
+-        for idx in tqdm(indexes):
++        if show_progress:
++            logger.info("Indexing and snapping points...")
++        for idx in tqdm(indexes, disable=not show_progress):
+             is_close_all = []
++            nearest_all = [] if self.require_sift else None
+             for i, idx_inner in enumerate(predictions_dict["indexes"][idx]):
+-                distances, indices = indexes_all[idx_inner].search(
+-                    predictions_dict["tracks"][idx][0, i], 1
+-                )
++                points = predictions_dict["tracks"][idx][0, i]
++                if self.require_sift:
++                    # A pairwise star is mostly invisible outside each
++                    # sampled edge; do not search all padded N-view columns.
++                    observed = np.flatnonzero(
++                        predictions_dict["scores"][idx][0, i].cpu().numpy() > 0
++                    )
++                    distances = np.full((len(points), 1), np.inf, dtype=np.float32)
++                    indices = np.full((len(points), 1), -1, dtype=np.int64)
++                    if len(observed):
++                        distances[observed], indices[observed] = (
++                            indexes_all[idx_inner].search(points[observed], 1)
++                        )
++                else:
++                    distances, indices = indexes_all[idx_inner].search(points, 1)
+                 if query_points_full[idx_inner].shape == (1, 0, 2):
+                     is_close = np.zeros(
+                         (predictions_dict["tracks"][idx][0, i].shape[0],),
+                         dtype=bool,
+                     )
+                 else:
+-                    is_close = (
+-                        snapping_thres_dict[idx_inner] > distances
+-                    ).reshape(-1)
++                    if self.require_sift:
++                        is_close = (
++                            (distances[:, 0] <= snapping_thres_dict[idx_inner])
++                            & np.isfinite(distances[:, 0])
++                            & (indices[:, 0] >= 0)
++                        )
++                    else:
++                        is_close = (
++                            snapping_thres_dict[idx_inner] > distances
++                        ).reshape(-1)
+                     counter += (
+                         is_close
+                         * (predictions_dict["scores"][idx][0, i] > 0)
+@@ -156,12 +278,75 @@ class TrackSnapping:
+                     predictions_dict["scores"][idx][0, i] > 0
+                 ).sum()
+ 
+-                predictions_dict["scores"][idx][0, i, ~is_close] /= 2
++                if self.require_sift:
++                    predictions_dict["scores"][idx][0, i, ~is_close] = 0
++                    nearest_all.append(indices[:, 0])
++                else:
++                    predictions_dict["scores"][idx][0, i, ~is_close] /= 2
+ 
+                 is_close_all.append(is_close)
+ 
+             predictions_dict["is_close"][idx] = torch.from_numpy(
+                 np.stack(is_close_all, axis=0)
+             ).unsqueeze(0)
++            if self.require_sift:
++                self._consolidate_sift_tracks(predictions_dict, idx, nearest_all)
++
++        if show_progress:
++            logger.info(f"Total points snapped {counter} / {counter_valid}")
++
++    @staticmethod
++    def _consolidate_sift_tracks(
++        predictions_dict: dict, idx: int, nearest_all: list[np.ndarray]
++    ) -> None:
++        """Drop centerless edges and conflicts introduced by SIFT snapping."""
++        tracks = predictions_dict["tracks"][idx]
++        vis = predictions_dict["vis"][idx]
++        conf = predictions_dict["conf"][idx]
++        scores = predictions_dict["scores"][idx]
++        score_array = scores.cpu().numpy()
++        num_frames = tracks.shape[1]
++        candidates = []
++        for frame in range(1, num_frames):
++            valid = (score_array[0, 0] > 0) & (score_array[0, frame] > 0)
++            for column in np.flatnonzero(valid):
++                candidates.append((float(score_array[0, frame, column]), frame, column))
++        candidates.sort(key=lambda candidate: -candidate[0])
++
++        groups = {}
++        claimed = [dict() for _ in range(num_frames)]
++        for _, frame, column in candidates:
++            center_id = int(nearest_all[0][column])
++            neighbor_id = int(nearest_all[frame][column])
++            owner = claimed[frame].get(neighbor_id)
++            if owner is not None and owner != center_id:
++                continue
++            observations = groups.get(center_id)
++            if observations is not None and frame in observations:
++                continue
++            if observations is None:
++                observations = {0: column}
++                groups[center_id] = observations
++            elif score_array[0, 0, column] > score_array[0, 0, observations[0]]:
++                observations[0] = column
++            observations[frame] = column
++            claimed[frame][neighbor_id] = center_id
+ 
+-        logger.info(f"Total points snapped {counter} / {counter_valid}")
++        shape = (1, num_frames, len(groups))
++        new_tracks = tracks.new_zeros((*shape, 2))
++        new_vis = vis.new_zeros(shape)
++        new_conf = conf.new_zeros(shape)
++        new_scores = scores.new_zeros(shape)
++        new_close = torch.zeros(shape, dtype=torch.bool)
++        for column, observations in enumerate(groups.values()):
++            for frame, source_column in observations.items():
++                new_tracks[0, frame, column] = tracks[0, frame, source_column]
++                new_vis[0, frame, column] = vis[0, frame, source_column]
++                new_conf[0, frame, column] = conf[0, frame, source_column]
++                new_scores[0, frame, column] = scores[0, frame, source_column]
++                new_close[0, frame, column] = True
++        predictions_dict["tracks"][idx] = new_tracks
++        predictions_dict["vis"][idx] = new_vis
++        predictions_dict["conf"][idx] = new_conf
++        predictions_dict["scores"][idx] = new_scores
++        predictions_dict["is_close"][idx] = new_close
+diff --git a/gluemap/ff_inference/local_inference.py b/gluemap/ff_inference/local_inference.py
+index 5424366..8a08900 100644
+--- a/gluemap/ff_inference/local_inference.py
++++ b/gluemap/ff_inference/local_inference.py
+@@ -35,11 +35,33 @@ class LocalInference(ABC):
+         ...
+ 
+ 
++def confident_depth_mask(
++    depth: torch.Tensor, confidence: torch.Tensor, quantile: float
++) -> torch.Tensor:
++    """Mask finite positive depths whose confidence reaches the per-image quantile.
++
++    Args:
++        depth: ``(B, N, H, W, 1)`` depth.
++        confidence: ``(B, N, H, W)`` depth confidence.
++        quantile: Per-image confidence cutoff in ``[0, 1)``.
++    """
++    eligible = torch.isfinite(depth[..., 0]) & (depth[..., 0] > 0) & torch.isfinite(confidence)
++    valid = torch.zeros_like(eligible)
++    for b in range(depth.shape[0]):
++        for n in range(depth.shape[1]):
++            scores = confidence[b, n][eligible[b, n]]
++            if scores.numel():
++                cutoff = torch.quantile(scores, quantile)
++                valid[b, n] = eligible[b, n] & (confidence[b, n] >= cutoff)
++    return valid
++
++
+ def create_local_inference(
+     model: torch.nn.Module,
+     model_type: str,
+     device: str | torch.device = "cuda",
+     dtype: torch.dtype = torch.bfloat16,
++    confidence_quantile: float = 0.5,
+ ) -> LocalInference:
+     """Factory to create the appropriate :class:`LocalInference` subclass.
+ 
+@@ -47,9 +69,10 @@ def create_local_inference(
+         model: Loaded backbone network whose architecture matches
+             ``model_type``.
+         model_type: One of ``"pi3"``, ``"pi3x"``, ``"vggt"``,
+-            ``"map_anything"``.
++            ``"vggt_omega"``, ``"amb3r"``, ``"map_anything"``.
+         device: Device on which inputs are placed before the backbone runs.
+         dtype: Autocast dtype used during the backbone forward pass.
++        confidence_quantile: Per-image depth-confidence cutoff for VGGT-Omega and AMB3R.
+ 
+     Returns:
+         A concrete :class:`LocalInference` subclass wrapping ``model``.
+@@ -65,6 +88,14 @@ def create_local_inference(
+         from gluemap.ff_inference.vggt_inference import VGGTLocalInference
+ 
+         return VGGTLocalInference(model, device, dtype)
++    elif model_type == "vggt_omega":
++        from gluemap.ff_inference.vggt_omega_inference import VGGTOmegaLocalInference
++
++        return VGGTOmegaLocalInference(model, device, dtype, confidence_quantile)
++    elif model_type == "amb3r":
++        from gluemap.ff_inference.amb3r_inference import Amb3rLocalInference
++
++        return Amb3rLocalInference(model, device, dtype, confidence_quantile)
+     elif model_type == "map_anything":
+         from gluemap.ff_inference.mapanything_inference import (
+             MapAnythingLocalInference,
+diff --git a/gluemap/math/reprojection_error.py b/gluemap/math/reprojection_error.py
+index 646941a..3300ded 100644
+--- a/gluemap/math/reprojection_error.py
++++ b/gluemap/math/reprojection_error.py
+@@ -18,6 +18,18 @@ class ReprojectionErrorType(Enum):
+     ANGULAR = "angular"
+ 
+ 
++def _camera_focal_xy(camera: pycolmap.Camera) -> tuple[float, float]:
++    """Return focal lengths without assuming a single-focal camera model."""
++    focal_idxs = list(camera.focal_length_idxs())
++    if len(focal_idxs) == 1:
++        focal = float(camera.focal_length)
++        return focal, focal
++    if len(focal_idxs) >= 2:
++        params = np.asarray(camera.params, dtype=float)
++        return float(params[focal_idxs[0]]), float(params[focal_idxs[1]])
++    raise ValueError(f"Camera model {camera.model.name} has no focal length")
++
++
+ def compute_point_error(
+     world_point: np.ndarray,
+     R: np.ndarray,
+@@ -69,7 +81,16 @@ def compute_point_error(
+             + (projected[1] - observed[1]) ** 2
+         )
+         if error_type == ReprojectionErrorType.NORMALIZED:
+-            return pixel_error / camera.focal_length
++            fx, fy = _camera_focal_xy(camera)
++            if abs(fx) < 1e-12 or abs(fy) < 1e-12:
++                return float("inf")
++            normalized_residual = np.array(
++                [
++                    (projected[0] - observed[0]) / fx,
++                    (projected[1] - observed[1]) / fy,
++                ]
++            )
++            return float(np.linalg.norm(normalized_residual))
+         return pixel_error
+ 
+ 
+@@ -123,7 +144,12 @@ def _compute_errors_batch(
+         projected = camera.img_from_cam(X_proc[valid])  # (M, 2)
+         pixel_errors = np.linalg.norm(projected - observed[valid], axis=1)
+         if error_type == ReprojectionErrorType.NORMALIZED:
+-            pixel_errors = pixel_errors / camera.focal_length
++            fx, fy = _camera_focal_xy(camera)
++            if abs(fx) < 1e-12 or abs(fy) < 1e-12:
++                return errors
++            residuals = projected - observed[valid]
++            residuals = residuals / np.array([fx, fy])
++            pixel_errors = np.linalg.norm(residuals, axis=1)
+         errors[valid] = pixel_errors
+ 
+     return errors
+diff --git a/gluemap/pybind/bindings.cc b/gluemap/pybind/bindings.cc
+index 172a0b1..7f5c055 100644
+--- a/gluemap/pybind/bindings.cc
++++ b/gluemap/pybind/bindings.cc
+@@ -36,6 +36,17 @@ ceres::Manifold *CreatePoseManifold() {
+                                     ceres::EuclideanManifold<3>>();
+ }
+ 
++// Attach directly to a problem that owns its manifolds. Returning this manifold
++// to Python would give both Python and the Ceres problem ownership of it.
++void SetPoseManifold(
++    ceres::Problem &problem,
++    py::array_t<double, py::array::c_style> cam_from_world) {
++  if (cam_from_world.size() != 7) {
++    throw py::value_error("A camera pose must contain 7 parameters.");
++  }
++  problem.SetManifold(cam_from_world.mutable_data(), CreatePoseManifold());
++}
++
+ // Helper function to create a ProductManifold for 7D pose with fixed
+ // translation component
+ ceres::Manifold *
+@@ -113,6 +124,11 @@ PYBIND11_MODULE(pygluemap, m) {
+       "camera_model_id"_a, "point2D"_a,
+       "Reprojection error with negative depth.");
+ 
++  m.def("set_pose_manifold", &SetPoseManifold, py::arg("problem"),
++        py::arg("cam_from_world").noconvert(),
++        "Attach a quaternion/translation manifold to an existing pose block. "
++        "The Ceres problem must own its manifolds.");
++
+   // Manifold creation helpers for 7D pose (quaternion + translation)
+   m.def("CreatePoseManifold", &CreatePoseManifold,
+         py::return_value_policy::take_ownership,
+diff --git a/gluemap/utils/cli.py b/gluemap/utils/cli.py
+index b39eb3d..bbb57fa 100644
+--- a/gluemap/utils/cli.py
++++ b/gluemap/utils/cli.py
+@@ -48,9 +48,27 @@ def get_args_parser() -> argparse.ArgumentParser:
+     parser.add_argument(
+         "--chosen_model",
+         default="pi3",
+-        choices=["pi3", "pi3x", "vggt", "map_anything"],
++        choices=["pi3", "pi3x", "vggt", "vggt_omega", "map_anything", "amb3r"],
+         help="which model to use for multi-view pose estimation",
+     )
++    parser.add_argument("--chosen_retrieval", choices=["salad", "megaloc"], default="salad")
++    parser.add_argument("--chosen_tracker", choices=["vggsfm", "romav2"], default="vggsfm")
++    parser.add_argument("--omega_source", type=str, default="")
++    parser.add_argument("--amb3r_source", type=str, default="")
++    parser.add_argument("--amb3r_python", type=str, default="")
++    parser.add_argument("--megaloc_source", type=str, default="")
++    parser.add_argument("--roma_source", type=str, default="")
++    parser.add_argument("--roma_setting", choices=["fast", "precise"], default="precise")
++    parser.add_argument("--roma_max_matches", type=int, default=1024)
++    parser.add_argument("--roma_center_radius", type=float, default=1.0)
++    parser.add_argument(
++        "--sift_snap_database", type=str, default="",
++        help="Read-only SIFT keypoint database for early RoMa track compaction",
++    )
++    parser.add_argument(
++        "--depth_confidence_quantile", type=float, default=0.5,
++        help="Per-image VGGT-Omega confidence quantile, not an absolute confidence score",
++    )
+ 
+     parser.add_argument(
+         "--path_feedforward",
+@@ -265,6 +283,39 @@ def get_args_parser() -> argparse.ArgumentParser:
+         ),
+     )
+ 
++    parser.add_argument(
++        "--refine_intrinsics",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help=(
++            "allow bundle adjustment to refine camera intrinsics. Default "
++            "False holds them FIXED at their seeded values. Enable ONLY for a "
++            "deliberate self-calibration measurement pass -- a production map "
++            "must not ship with unvalidated floating intrinsics"
++        ),
++    )
++
++    parser.add_argument(
++        "--min_track_length",
++        default=2,
++        type=int,
++        help="minimum track length kept after BA outlier filtering",
++    )
++
++    parser.add_argument(
++        "--extra_pairs_path",
++        default=None,
++        type=str,
++        help=(
++            "path to a text file of forced image pairs, one 'nameA nameB' per "
++            "line (paths relative to images_path). Unioned into the retrieval "
++            "pair graph. Use to force VPR-blind bridge candidates across "
++            "sequences (e.g. forward<->reverse), which global descriptors "
++            "cannot retrieve. These are CANDIDATES only -- two-view geometry "
++            "and Doppelgangers still decide whether they survive"
++        ),
++    )
++
+     parser.add_argument(
+         "--gt_intrinsics_path",
+         default=None,
+diff --git a/gluemap/utils/colmap.py b/gluemap/utils/colmap.py
+index 2649caf..890e60c 100644
+--- a/gluemap/utils/colmap.py
++++ b/gluemap/utils/colmap.py
+@@ -65,7 +65,7 @@ def extract_gt_intrinsics(
+     """Extract GT intrinsics from a COLMAP reconstruction directory.
+ 
+     Returns List[Optional[torch.Tensor]] indexed by camera_id,
+-    each tensor shape (1, 3, 3), matching global_intrinsics format.
++    each float64 tensor shape (1, 3, 3), preserving calibrated COLMAP precision.
+     """
+     gt_recon = pycolmap.Reconstruction()
+     gt_recon.read(gt_path)
+@@ -75,7 +75,7 @@ def extract_gt_intrinsics(
+         key = os.path.basename(img.name) if match_by_basename else img.name
+         name_to_gt_cam[key] = gt_recon.cameras[img.camera_id]
+ 
+-    num_cameras = max(intrinsics_mapping) + 1
++    num_cameras = max(intrinsics_mapping.values(), default=-1) + 1
+     gt_intrinsics = [None] * num_cameras
+ 
+     for i, name in enumerate(images_list):
+@@ -85,7 +85,7 @@ def extract_gt_intrinsics(
+             gt_cam = name_to_gt_cam[key]
+             K = gt_cam.calibration_matrix()
+             gt_intrinsics[cam_id] = torch.tensor(
+-                K, dtype=torch.float32
++                K, dtype=torch.float64
+             ).unsqueeze(0)
+ 
+     num_set = sum(1 for x in gt_intrinsics if x is not None)
+diff --git a/gluemap/utils/model_loader.py b/gluemap/utils/model_loader.py
+index 811fc4e..8f621e1 100644
+--- a/gluemap/utils/model_loader.py
++++ b/gluemap/utils/model_loader.py
+@@ -1,5 +1,7 @@
+ import argparse
+ import os
++import sys
++from pathlib import Path
+ 
+ import numpy as np
+ import torch
+@@ -56,12 +58,15 @@ def load_models(
+ 
+     Each entry in ``keys`` triggers loading of one model:
+ 
+-    * ``"pi3"`` / ``"pi3x"`` / ``"vggt"`` / ``"map_anything"`` — multi-view
+-      pose backbones, weights from ``args.path_feedforward``.
++    * ``"pi3"`` / ``"pi3x"`` / ``"vggt"`` / ``"vggt_omega"`` / ``"amb3r"`` /
++      ``"map_anything"`` — multi-view pose backbones, weights from
++      ``args.path_feedforward``.
+     * ``"dg"`` — Doppelganger++ (MASt3R), weights from ``args.path_dg``.
+     * ``"vggsfm"`` — VGGSfM tracker, weights from ``args.path_tracker``.
+     * ``"salad"`` — SALAD VPR descriptor, weights from
+       ``args.path_retrieval``.
++    * ``"megaloc"`` — local MegaLoc source and safetensors retrieval weights.
++    * ``"romav2"`` — official RoMa v2 star-edge matcher.
+ 
+     Models are moved to CPU when ``args.cpu`` is set, otherwise to
+     ``cuda`` when available. Under ``args.distributed`` they are wrapped
+@@ -70,21 +75,18 @@ def load_models(
+     Args:
+         args: Namespace produced by :func:`gluemap.utils.cli.get_args_parser`,
+             extended with distributed flags by :func:`init_distributed_mode`.
+-        keys: Which models to load. ``args.chosen_model`` is auto-added.
++        keys: Models to load; defaults to only ``args.chosen_model``.
+ 
+     Returns:
+         ``(models, device)`` where ``models[args.chosen_model]`` is also
+         aliased as ``models["mv"]`` for downstream callers.
+ 
+-    Note:
+-        ``keys`` defaults to ``None`` (treated as an empty set). The function
+-        does mutate the set passed in (adding ``args.chosen_model``);
+-        callers that pass their own set should expect that mutation.
+     """
+-    if keys is None:
+-        keys = set()
++    from gluemap.ff_inference.amb3r_inference import Amb3rWorkerClient
++
+     chosen_model = getattr(args, "chosen_model", "pi3")
+-    keys.add(chosen_model)
++    if keys is None:
++        keys = {chosen_model}
+ 
+     models = {}
+ 
+@@ -110,6 +112,23 @@ def load_models(
+                 args.path_feedforward, map_location="cpu", weights_only=False
+             )
+         )
++    elif chosen_model == "vggt_omega" and chosen_model in keys:
++        source = Path(args.omega_source).expanduser().resolve()
++        if str(source) not in sys.path:
++            sys.path.insert(0, str(source))
++        from vggt_omega.models import VGGTOmega
++
++        models["vggt_omega"] = VGGTOmega()
++        models["vggt_omega"].load_state_dict(
++            torch.load(args.path_feedforward, map_location="cpu", weights_only=True),
++            strict=True,
++        )
++    elif chosen_model == "amb3r" and chosen_model in keys:
++        if args.distributed:
++            raise ValueError("amb3r backbone does not support distributed inference")
++        models["amb3r"] = Amb3rWorkerClient(
++            args.amb3r_python, args.amb3r_source, args.path_feedforward
++        )
+     elif chosen_model == "map_anything" and chosen_model in keys:
+         from mapanything.models.mapanything.model import MapAnything
+ 
+@@ -180,12 +199,35 @@ def load_models(
+             strict=False,
+         )
+ 
++    if "megaloc" in keys:
++        import importlib.util
++
++        spec = importlib.util.spec_from_file_location(
++            "_gluemap_megaloc", Path(args.megaloc_source) / "megaloc_model.py"
++        )
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        models["megaloc"] = module.MegaLoc()
++        models["megaloc"].load_state_dict(load_file(args.path_retrieval, device="cpu"), strict=True)
++
++    if "romav2" in keys:
++        source = Path(args.roma_source).expanduser().resolve()
++        if str(source) not in sys.path:
++            sys.path.insert(0, str(source))
++        from romav2 import RoMaV2
++
++        models["romav2"] = RoMaV2(
++            RoMaV2.Cfg(setting=getattr(args, "roma_setting", "precise"), compile=False)
++        )
++
+     if getattr(args, "cpu", False):
+         device = torch.device("cpu")
+     else:
+         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+     for _model_name, model in models.items():
++        if isinstance(model, Amb3rWorkerClient):
++            continue
+         model.eval()
+         model.to(device)
+ 
+@@ -217,7 +259,7 @@ def load_all_models(
+     if getattr(args, "direct_inference", False):
+         keys = {chosen_model}
+     else:
+-        keys = {"salad", "dg", chosen_model}
++        keys = {getattr(args, "chosen_retrieval", "salad"), "dg", chosen_model}
+         if not getattr(args, "use_dummy_tracks", False):
+-            keys.add("vggsfm")
++            keys.add(getattr(args, "chosen_tracker", "vggsfm"))
+     return load_models(args, keys=keys)
+diff --git a/tests/test_augmented_bundle_adjustment.py b/tests/test_augmented_bundle_adjustment.py
+index a17507e..558ccba 100644
+--- a/tests/test_augmented_bundle_adjustment.py
++++ b/tests/test_augmented_bundle_adjustment.py
+@@ -10,6 +10,7 @@ import logging
+ 
+ import numpy as np
+ import pycolmap
++import pytest
+ 
+ from gluemap.estimators.augmented_bundle_adjustment import bundle_adjustment
+ from tests.helpers import create_synthetic_reconstruction, perturb_points3D
+@@ -437,3 +438,48 @@ class TestBundleAdjustmentEndToEnd:
+         # looser thresholds than the multi-view tests above.
+         assert max_rot < 2.0, f"Max rotation error {max_rot:.4f} deg >= 2.0 deg"
+         assert max_center < 0.1, f"Max center error {max_center:.6f} >= 0.1"
++
++
++def test_virtual_only_image_remains_a_rigid_pose():
++    """An image without SIFT observations must not gain a free quaternion."""
++    from scipy.spatial.transform import Rotation
++
++    source = create_synthetic_reconstruction(
++        num_frames=5, num_points3D=60, seed=42
++    )
++    ids = sorted(source.point3D_ids())
++    real = split_reconstruction(source, ids[:20])
++    virtual = split_reconstruction(source, ids[20:])
++    image_id = max(real.images)
++    for index, point in enumerate(real.images[image_id].points2D):
++        if point.has_point3D():
++            real.delete_observation(image_id, index)
++
++    pose = real.frames[image_id].rig_from_world
++    pose.rotation.quat[:] = Rotation.from_rotvec([0.3, -0.2, 0.4]).as_quat()
++    pose.translation[:] += np.array([0.5, -0.3, 0.2])
++    rng = np.random.default_rng(5)
++    for point in virtual.images[image_id].points2D:
++        point.xy = point.xy + rng.normal(0, 1, 2)
++
++    real, virtual, summary = bundle_adjustment(
++        real, virtual, {}, max_num_iterations=100
++    )
++    assert np.isfinite(summary.final_cost)
++    for reconstruction in (real, virtual):
++        optimized_pose = reconstruction.frames[image_id].rig_from_world
++        np.testing.assert_allclose(
++            np.linalg.norm(optimized_pose.rotation.quat), 1.0, atol=1e-12
++        )
++        rotation = optimized_pose.rotation.matrix()
++        np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-12)
++        np.testing.assert_allclose(np.linalg.det(rotation), 1.0, atol=1e-12)
++
++
++def test_failed_solve_is_not_returned_as_a_reconstruction():
++    source = create_synthetic_reconstruction(
++        num_frames=5, num_points3D=20, seed=7
++    )
++    source.points3D[min(source.point3D_ids())].xyz[:] = np.nan
++    with pytest.raises(RuntimeError, match="Augmented bundle adjustment failed"):
++        bundle_adjustment(source, None, {}, max_num_iterations=1)
+diff --git a/gluemap/estimators/roma_track_inference.py b/gluemap/estimators/roma_track_inference.py
+new file mode 100644
+index 0000000..d497e14
+--- /dev/null
++++ b/gluemap/estimators/roma_track_inference.py
+@@ -0,0 +1,181 @@
++"""Sparse multiview tracks from balanced RoMa v2 star-edge matches."""
++
++import math
++from collections import defaultdict
++
++import numpy as np
++import torch
++from PIL import Image
++
++from gluemap.estimators.track_inference import TrackInference
++from gluemap.math.scaling import standardize_query_points
++
++
++class _PixelAssociations:
++    """Associate to a fixed representative, without transitive pixel drift."""
++
++    def __init__(self, radius: float) -> None:
++        self.radius = radius
++        self.cells = defaultdict(list)
++
++    def _cell(self, point: np.ndarray) -> tuple[int, int]:
++        return tuple(math.floor(float(x) / self.radius) for x in point)
++
++    def find(self, point: np.ndarray) -> int | None:
++        x, y = self._cell(point)
++        nearest = None
++        distance = self.radius**2
++        for dx in (-1, 0, 1):
++            for dy in (-1, 0, 1):
++                for representative, index in self.cells.get((x + dx, y + dy), ()):
++                    squared_distance = float(((representative - point) ** 2).sum())
++                    if squared_distance <= distance:
++                        distance = squared_distance
++                        nearest = index
++        return nearest
++
++    def add(self, point: np.ndarray, index: int) -> None:
++        self.cells[self._cell(point)].append((point, index))
++
++
++class RoMaTrackInference:
++    """Match the center to each neighbor; only matched views are visible.
++
++    Matching uses original RGB images, not the padded VGGSfM 1024 canvas.
++    Pixel association is also in original-image pixels. Returned coordinates
++    are mapped into ``images_change`` space, exactly as for TrackInference;
++    the existing postprocessor restores originals before SIFT snapping.
++    ``vis`` and ``conf`` are overlap probabilities, not BA precision weights.
++    The official sampler's precision matrices are deliberately not forwarded:
++    the current augmented BA interface does not consume observation precision.
++    """
++
++    def __init__(
++        self,
++        model_track: torch.nn.Module | None,
++        device: str = "cuda",
++        max_matches: int = 1024,
++        center_radius: float = 1.0,
++    ) -> None:
++        if max_matches <= 0:
++            raise ValueError("RoMa max_matches must be positive")
++        if not math.isfinite(center_radius) or center_radius <= 0:
++            raise ValueError("RoMa center_radius must be finite and positive")
++        self.model_track = getattr(model_track, "module", model_track)
++        self.device = device
++        self.max_matches = max_matches
++        self.center_radius = center_radius
++
++    def _sample_edge(self, center: Image.Image, neighbor: Image.Image):
++        predictions = self.model_track.match(center, neighbor)
++        # RoMa's sampler draws 4 * num_corresp without replacement before
++        # density balancing. Bound that request even on low-overlap edges.
++        supported = 0
++        for direction in ("AB", "BA"):
++            warp = predictions.get(f"warp_{direction}")
++            if warp is None:
++                continue
++            overlap = torch.nan_to_num(
++                predictions[f"overlap_{direction}"], nan=0.0, posinf=0.0, neginf=0.0
++            ).clamp_(0.0, 1.0)
++            predictions[f"overlap_{direction}"] = overlap
++            inside = warp.abs().amax(dim=-1) <= 1 - 1 / warp.shape[1]
++            supported += int((inside & (overlap[..., 0] > 0)).sum().item())
++        sample_count = min(self.max_matches, supported // 4)
++        if sample_count == 0:
++            return np.empty((0, 2)), np.empty((0, 2)), np.empty(0)
++        matches, overlap, _, _ = self.model_track.sample(predictions, sample_count)
++        center_points, neighbor_points = self.model_track.to_pixel_coordinates(
++            matches, center.height, center.width, neighbor.height, neighbor.width
++        )
++        valid = (
++            torch.isfinite(center_points).all(dim=-1)
++            & torch.isfinite(neighbor_points).all(dim=-1)
++            & torch.isfinite(overlap)
++            & (overlap > 0.05)
++            & (center_points[:, 0] >= 0)
++            & (center_points[:, 0] < center.width)
++            & (center_points[:, 1] >= 0)
++            & (center_points[:, 1] < center.height)
++            & (neighbor_points[:, 0] >= 0)
++            & (neighbor_points[:, 0] < neighbor.width)
++            & (neighbor_points[:, 1] >= 0)
++            & (neighbor_points[:, 1] < neighbor.height)
++        )
++        return (
++            center_points[valid].float().cpu().numpy(),
++            neighbor_points[valid].float().cpu().numpy(),
++            overlap[valid].float().cpu().numpy(),
++        )
++
++    def _predict_star(self, paths: list[str]) -> list[dict]:
++        centers = _PixelAssociations(self.center_radius)
++        tracks = []
++        with Image.open(paths[0]) as source:
++            center = source.convert("RGB")
++        try:
++            for frame, path in enumerate(paths[1:], start=1):
++                with Image.open(path) as source:
++                    neighbor = source.convert("RGB")
++                try:
++                    points_a, points_b, overlaps = self._sample_edge(center, neighbor)
++                finally:
++                    neighbor.close()
++                neighbors = _PixelAssociations(self.center_radius)
++                # Sampling is spatially balanced. Confidence ordering only
++                # resolves duplicate/conflicting observations within that set.
++                for sample in np.argsort(-overlaps, kind="stable"):
++                    point_a, point_b = points_a[sample], points_b[sample]
++                    score = float(overlaps[sample])
++                    track_id = centers.find(point_a)
++                    if neighbors.find(point_b) is not None:
++                        continue
++                    if track_id is not None and frame in tracks[track_id]:
++                        continue
++                    if track_id is None:
++                        track_id = len(tracks)
++                        centers.add(point_a, track_id)
++                        tracks.append({0: (point_a, score)})
++                    else:
++                        anchor, previous = tracks[track_id][0]
++                        tracks[track_id][0] = (anchor, max(previous, score))
++                    tracks[track_id][frame] = (point_b, score)
++                    neighbors.add(point_b, track_id)
++        finally:
++            center.close()
++        return tracks
++
++    @torch.inference_mode()
++    def predict(
++        self,
++        batch: dict[str, torch.Tensor],
++        use_dummy_tracks: bool = False,
++    ) -> dict[str, torch.Tensor]:
++        if use_dummy_tracks:
++            return TrackInference(None, self.device).predict(batch, use_dummy_tracks=True)
++        if self.model_track is None:
++            raise ValueError("RoMa track inference requires a loaded RoMa v2 model")
++        batch_size, num_frames = batch["images"].shape[:2]
++        image_paths = batch["image_paths"]  # Default-collated: frame, then batch.
++        previous_precision = torch.get_float32_matmul_precision()
++        torch.set_float32_matmul_precision("highest")
++        try:
++            stars = [
++                self._predict_star([image_paths[j][i] for j in range(num_frames)])
++                for i in range(batch_size)
++            ]
++        finally:
++            torch.set_float32_matmul_precision(previous_precision)
++        num_tracks = max((len(star) for star in stars), default=0)
++        track = torch.zeros(batch_size, num_frames, num_tracks, 2)
++        vis = torch.zeros(batch_size, num_frames, num_tracks)
++        for i, star in enumerate(stars):
++            for k, observations in enumerate(star):
++                for j, (point, score) in observations.items():
++                    track[i, j, k] = torch.from_numpy(point)
++                    vis[i, j, k] = score
++            for j in range(num_frames):
++                standardize_query_points(track[i, j], batch["images_change"][i][j])
++        track = track.to(self.device)
++        vis = vis.to(self.device)
++        return {"track": track, "vis": vis, "conf": vis.clone()}
+diff --git a/gluemap/ff_inference/amb3r_inference.py b/gluemap/ff_inference/amb3r_inference.py
+new file mode 100644
+index 0000000..6133493
+--- /dev/null
++++ b/gluemap/ff_inference/amb3r_inference.py
+@@ -0,0 +1,160 @@
++import json
++import os
++import struct
++import subprocess
++import tempfile
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from gluemap.ff_inference.local_inference import LocalInference, confident_depth_mask
++
++_STDERR_TAIL_BYTES = 4000
++
++
++class Amb3rWorkerClient:
++    """Drive ``amb3r_worker.py`` in the AMB3R environment over a binary pipe.
++
++    AMB3R needs spconv/pytorch3d/flash-attn on a different Python than GlueMap,
++    so it lives in a separate process. Depth and translations come back in
++    metres (see ``amb3r_worker.py``).
++    """
++
++    def __init__(self, python: str, source: str, checkpoint: str) -> None:
++        self.process = None
++        if not python or not source or not checkpoint:
++            raise ValueError("amb3r requires --amb3r_python, --amb3r_source and --path_feedforward")
++        for label, value in (("python", python), ("source", source), ("checkpoint", checkpoint)):
++            if not Path(value).expanduser().exists():
++                raise ValueError(f"amb3r {label} does not exist: {value}")
++        worker = Path(__file__).with_name("amb3r_worker.py").resolve()
++        self._stderr = tempfile.TemporaryFile()
++        self.process = subprocess.Popen(
++            [
++                str(Path(python).expanduser()),
++                str(worker),
++                "--source",
++                str(Path(source).expanduser().resolve()),
++                "--checkpoint",
++                str(Path(checkpoint).expanduser().resolve()),
++            ],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=self._stderr,
++        )
++        header, _ = self._receive_header()
++        if not header.get("ready"):
++            self._fail("AMB3R worker did not signal readiness")
++
++    def _stderr_tail(self) -> str:
++        self._stderr.flush()
++        self._stderr.seek(0, os.SEEK_END)
++        size = self._stderr.tell()
++        self._stderr.seek(max(0, size - _STDERR_TAIL_BYTES))
++        return self._stderr.read().decode("utf-8", errors="replace")
++
++    def _fail(self, message: str) -> None:
++        raise RuntimeError(f"{message}\n--- worker stderr (tail) ---\n{self._stderr_tail()}")
++
++    def _read_exact(self, size: int) -> bytes:
++        chunks = []
++        remaining = size
++        while remaining:
++            chunk = self.process.stdout.read(remaining)
++            if not chunk:
++                self._fail("AMB3R worker closed its output unexpectedly")
++            chunks.append(chunk)
++            remaining -= len(chunk)
++        return b"".join(chunks)
++
++    def _receive_header(self):
++        (length,) = struct.unpack("<Q", self._read_exact(8))
++        header = json.loads(self._read_exact(length).decode("utf-8"))
++        if "error" in header:
++            self._fail(f"AMB3R worker error: {header['error']}")
++        return header, length
++
++    def predict_arrays(self, images: np.ndarray) -> dict:
++        """Run AMB3R on float32 ``(B, N, 3, H, W)`` images in [0, 1]."""
++        images = np.ascontiguousarray(images, dtype="<f4")
++        header = json.dumps({"shape": list(images.shape)}).encode("utf-8")
++        try:
++            self.process.stdin.write(struct.pack("<Q", len(header)))
++            self.process.stdin.write(header)
++            self.process.stdin.write(images.tobytes())
++            self.process.stdin.flush()
++        except (BrokenPipeError, OSError):
++            self._fail("AMB3R worker pipe is broken")
++        response, _ = self._receive_header()
++        arrays = {}
++        for name, shape in response["arrays"].items():
++            count = int(np.prod(shape))
++            data = self._read_exact(count * 4)
++            arrays[name] = np.frombuffer(data, dtype="<f4").reshape(shape).copy()
++        return arrays
++
++    def close(self) -> None:
++        process = getattr(self, "process", None)
++        if process is None:
++            return
++        self.process = None
++        try:
++            if process.stdin:
++                process.stdin.close()
++            try:
++                process.wait(timeout=30)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait()
++        finally:
++            if process.stdout:
++                process.stdout.close()
++            self._stderr.close()
++
++    def __del__(self) -> None:
++        try:
++            self.close()
++        except Exception:
++            pass
++
++
++class Amb3rLocalInference(LocalInference):
++    """Adapt metric AMB3R outputs to GlueMap's reference-view gauge."""
++
++    def __init__(self, model, device="cuda", dtype=torch.bfloat16, confidence_quantile=0.5):
++        super().__init__(model, device, dtype)
++        if not 0 <= confidence_quantile < 1:
++            raise ValueError("confidence_quantile must be in [0, 1)")
++        self.confidence_quantile = confidence_quantile
++
++    @torch.inference_mode()
++    def predict(self, batch: dict) -> dict:
++        # Dataset stars already place the center at slot zero. Do not reorder it.
++        images = batch["images"]
++        if images.ndim != 5 or images.shape[2] != 3:
++            raise ValueError("images must have shape (B, N, 3, H, W)")
++        if any(size % 14 for size in images.shape[-2:]):
++            raise ValueError("AMB3R image dimensions must align to 14-pixel patches")
++        out = self.model.predict_arrays(images.float().cpu().numpy())
++        device = torch.device(self.device)
++        depth = torch.from_numpy(out["depth"]).to(device).unsqueeze(-1)
++        confidence = torch.from_numpy(out["depth_conf"]).to(device)
++        extrinsics = torch.from_numpy(out["extrinsic"]).to(device)
++        intrinsics = torch.from_numpy(out["intrinsic"]).to(device)
++        expected = (*images.shape[:2], *images.shape[-2:])
++        if depth.shape != (*expected, 1) or confidence.shape != expected:
++            raise ValueError("AMB3R depth/confidence shape does not match input images")
++        bottom = extrinsics.new_zeros((*extrinsics.shape[:2], 1, 4))
++        bottom[..., 0, 3] = 1
++        extrinsics = torch.cat((extrinsics, bottom), dim=-2)
++        # Rigid re-gauging keeps translation lengths (metres) unchanged.
++        extrinsics = extrinsics @ torch.linalg.inv(extrinsics[:, :1])
++        valid = confident_depth_mask(depth, confidence, self.confidence_quantile)
++        return {
++            "depth": depth,
++            "depth_conf": confidence,
++            "depth_valid_mask": valid,
++            "extrinsics": extrinsics,
++            "intrinsics": intrinsics,
++        }
+diff --git a/gluemap/ff_inference/amb3r_worker.py b/gluemap/ff_inference/amb3r_worker.py
+new file mode 100644
+index 0000000..162f8e8
+--- /dev/null
++++ b/gluemap/ff_inference/amb3r_worker.py
+@@ -0,0 +1,123 @@
++"""Standalone AMB3R inference worker (runs in the AMB3R conda environment).
++
++This script must not import ``gluemap``: the AMB3R environment has a different
++Python / torch stack than GlueMap. It speaks a length-prefixed binary protocol
++over stdin/stdout (little endian):
++
++    message = uint64 header_length | UTF-8 JSON header | raw float32 C-order bytes
++
++Startup sends ``{"ready": true}``. A request header is ``{"shape": [B,N,3,H,W]}``
++followed by float32 images in [0, 1]. The response header is
++``{"arrays": {name: shape}}`` followed by the arrays concatenated in header
++order, or ``{"error": "..."}`` followed by exit code 1. EOF on stdin exits 0.
++
++Translations and depth are both multiplied by the same per-sample metric scale
++``m = median_n(median_metric_z / median(depth))`` so they stay in one unit
++(metres).
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import struct
++import sys
++import traceback
++
++
++def _read_exact(stream, size: int) -> bytes:
++    chunks = []
++    remaining = size
++    while remaining:
++        chunk = stream.read(remaining)
++        if not chunk:
++            if remaining == size and not chunks:
++                return b""
++            raise EOFError("truncated message")
++        chunks.append(chunk)
++        remaining -= len(chunk)
++    return b"".join(chunks)
++
++
++def _send(out, header: dict, payload: bytes = b"") -> None:
++    blob = json.dumps(header).encode("utf-8")
++    out.write(struct.pack("<Q", len(blob)))
++    out.write(blob)
++    out.write(payload)
++    out.flush()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--source", required=True)
++    parser.add_argument("--checkpoint", required=True)
++    args = parser.parse_args()
++
++    if not os.path.isdir(args.source):
++        print(f"AMB3R source directory not found: {args.source}", file=sys.stderr)
++        sys.exit(1)
++    if not os.path.isfile(args.checkpoint):
++        print(f"AMB3R checkpoint not found: {args.checkpoint}", file=sys.stderr)
++        sys.exit(1)
++
++    # Keep the protocol channel clean: everything printed by libraries goes to stderr.
++    out = os.fdopen(os.dup(1), "wb")
++    os.dup2(2, 1)
++    stdin = sys.stdin.buffer
++
++    import numpy as np
++    import torch
++
++    sys.path.insert(0, args.source)
++    from amb3r.model import AMB3R
++
++    model = AMB3R()
++    model.load_weights(args.checkpoint)
++    model.cuda().eval()
++    _send(out, {"ready": True})
++
++    while True:
++        raw = _read_exact(stdin, 8)
++        if not raw:
++            sys.exit(0)
++        try:
++            (length,) = struct.unpack("<Q", raw)
++            header = json.loads(_read_exact(stdin, length).decode("utf-8"))
++            shape = tuple(int(v) for v in header["shape"])
++            count = int(np.prod(shape))
++            data = _read_exact(stdin, count * 4)
++            images = np.frombuffer(data, dtype="<f4").reshape(shape)
++            with torch.inference_mode():
++                x = torch.from_numpy(images.copy()).cuda() * 2.0 - 1.0
++                with torch.autocast("cuda", dtype=torch.bfloat16):
++                    res = model({"images": x})[-1]
++                depth = res["depth"].float()
++                median_depth = depth.flatten(2).median(dim=2).values
++                ratio = res["median_metric_z"].float()[..., 0] / (median_depth + 1e-8)
++                m = torch.median(ratio, dim=1).values
++                depth_metric = res["depth_metric"].float()[..., 0]
++                confidence = res["depth_conf"].float()
++                if confidence.ndim == 5:
++                    confidence = confidence.squeeze(-1)
++                extrinsic = res["extrinsic"].float().clone()
++                extrinsic[..., 3] *= m[:, None, None]
++                arrays = {
++                    "depth": depth_metric,
++                    "depth_conf": confidence,
++                    "extrinsic": extrinsic,
++                    "intrinsic": res["intrinsic"].float(),
++                }
++                arrays = {k: v.cpu().numpy().astype("<f4", copy=False) for k, v in arrays.items()}
++            _send(
++                out,
++                {"arrays": {k: list(v.shape) for k, v in arrays.items()}},
++                b"".join(np.ascontiguousarray(v).tobytes() for v in arrays.values()),
++            )
++        except Exception:
++            tail = "".join(traceback.format_exc().splitlines(keepends=True)[-12:])
++            _send(out, {"error": tail})
++            sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/gluemap/ff_inference/vggt_omega_inference.py b/gluemap/ff_inference/vggt_omega_inference.py
+new file mode 100644
+index 0000000..c88df4b
+--- /dev/null
++++ b/gluemap/ff_inference/vggt_omega_inference.py
+@@ -0,0 +1,51 @@
++import torch
++
++from gluemap.ff_inference.local_inference import LocalInference, confident_depth_mask
++
++
++class VGGTOmegaLocalInference(LocalInference):
++    """Adapt official VGGT-Omega outputs to GlueMap's reference-view gauge."""
++
++    def __init__(self, model, device="cuda", dtype=torch.bfloat16, confidence_quantile=0.5):
++        super().__init__(model, device, dtype)
++        if not 0 <= confidence_quantile < 1:
++            raise ValueError("confidence_quantile must be in [0, 1)")
++        self.confidence_quantile = confidence_quantile
++
++    @torch.inference_mode()
++    def predict(self, batch: dict) -> dict:
++        from vggt_omega.utils.pose_enc import encoding_to_camera
++
++        # Dataset stars already place the center at slot zero. Do not reorder it.
++        images = batch["images"].to(self.device)
++        if images.ndim != 5 or images.shape[2] != 3:
++            raise ValueError("images must have shape (B, N, 3, H, W)")
++        if any(size % 16 for size in images.shape[-2:]):
++            raise ValueError("VGGT-Omega image dimensions must align to 16-pixel patches")
++        with torch.autocast(device_type=torch.device(self.device).type, dtype=self.dtype):
++            predictions = self.model(images)
++        extrinsics, intrinsics = encoding_to_camera(
++            predictions["pose_enc"].float(), image_size_hw=images.shape[-2:]
++        )
++        bottom = extrinsics.new_zeros((*extrinsics.shape[:2], 1, 4))
++        bottom[..., 0, 3] = 1
++        extrinsics = torch.cat((extrinsics, bottom), dim=-2)
++        # The virtual-depth construction assumes the center camera is identity.
++        extrinsics = extrinsics @ torch.linalg.inv(extrinsics[:, :1])
++        depth = predictions["depth"].float()
++        confidence = predictions["depth_conf"].float()
++        if depth.ndim == 4:
++            depth = depth.unsqueeze(-1)
++        if confidence.ndim == 5:
++            confidence = confidence.squeeze(-1)
++        expected = (*images.shape[:2], *images.shape[-2:])
++        if depth.shape != (*expected, 1) or confidence.shape != expected:
++            raise ValueError("VGGT-Omega depth/confidence shape does not match input images")
++        valid = confident_depth_mask(depth, confidence, self.confidence_quantile)
++        return {
++            "depth": depth,
++            "depth_conf": confidence,
++            "depth_valid_mask": valid,
++            "extrinsics": extrinsics,
++            "intrinsics": intrinsics,
++        }
+diff --git a/tests/test_amb3r_inference.py b/tests/test_amb3r_inference.py
+new file mode 100644
+index 0000000..3af7c61
+--- /dev/null
++++ b/tests/test_amb3r_inference.py
+@@ -0,0 +1,93 @@
++import sys
++
++import numpy as np
++import pytest
++import torch
++
++from gluemap.estimators.covisibility_extraction import CovisibilityExtraction
++from gluemap.ff_inference.amb3r_inference import Amb3rLocalInference, Amb3rWorkerClient
++
++
++def _rotation(seed: int) -> np.ndarray:
++    q, _ = np.linalg.qr(np.random.default_rng(seed).normal(size=(3, 3)))
++    return q * np.sign(np.linalg.det(q))
++
++
++class _StubClient:
++    def __init__(self, extrinsic: np.ndarray, height: int, width: int):
++        self.extrinsic = extrinsic
++        self.height = height
++        self.width = width
++
++    def predict_arrays(self, images):
++        batch, views = images.shape[:2]
++        intrinsic = np.tile(
++            np.array([[30.0, 0, self.width / 2], [0, 30.0, self.height / 2], [0, 0, 1]], np.float32),
++            (batch, views, 1, 1),
++        )
++        return {
++            "depth": np.full((batch, views, self.height, self.width), 5.0, np.float32),
++            "depth_conf": np.ones((batch, views, self.height, self.width), np.float32),
++            "extrinsic": self.extrinsic.astype(np.float32),
++            "intrinsic": intrinsic,
++        }
++
++
++def test_extrinsics_normalised_to_first_view_and_stay_metric():
++    rotations = [_rotation(seed) for seed in range(3)]
++    centers = [np.array([4.0, -2.0, 1.0]), np.array([7.0, -2.0, 1.5]), np.array([4.0, 3.0, 2.0])]
++    extrinsic = np.zeros((1, 3, 3, 4))
++    for view, (rotation, center) in enumerate(zip(rotations, centers)):
++        extrinsic[0, view, :, :3] = rotation
++        extrinsic[0, view, :, 3] = -rotation @ center
++    inference = Amb3rLocalInference(_StubClient(extrinsic, 28, 42), device="cpu", confidence_quantile=0.25)
++    out = inference.predict({"images": torch.zeros(1, 3, 3, 28, 42)})
++
++    torch.testing.assert_close(out["extrinsics"][:, 0], torch.eye(4)[None], atol=1e-5, rtol=0)
++    # Relative translation length is the baseline in the reference camera frame:
++    # ||t_j - R_j R_0^T t_0||, computed here directly from the input poses.
++    for view in (1, 2):
++        relative_t = extrinsic[0, view, :, 3] - extrinsic[0, view, :, :3] @ rotations[0].T @ extrinsic[0, 0, :, 3]
++        assert out["extrinsics"][0, view, :3, 3].norm().item() == pytest.approx(
++            np.linalg.norm(relative_t), rel=1e-4
++        )
++    assert out["depth"].shape == (1, 3, 28, 42, 1)
++    assert out["depth_valid_mask"].any()
++
++
++def test_covisibility_is_unit_equivariant():
++    height = width = 32
++
++    def run(scale: float):
++        extrinsics = torch.eye(4)[None, None].expand(1, 2, -1, -1).clone()
++        extrinsics[0, 1, :3, 3] = torch.tensor([0.3, 0.1, 0.0]) * scale
++        intrinsics = torch.tensor(
++            [[20.0, 0.0, width / 2], [0.0, 20.0, height / 2], [0.0, 0.0, 1.0]]
++        )[None, None].expand(1, 2, -1, -1).clone()
++        depth = torch.full((1, 2, height, width, 1), 2.0 * scale)
++        valid = torch.ones((1, 2, height, width), dtype=torch.bool)
++        extractor = CovisibilityExtraction(virtual_stride=8)
++        world = extractor._convert_from_depth_to_world_points(depth, extrinsics, intrinsics)
++        scores, _ = extractor._verify_by_reprojection_n2(
++            world, extrinsics, intrinsics, depth_valid_mask=valid
++        )
++        torch.manual_seed(0)  # virtual depths carry 10% multiplicative noise
++        tracks = extractor._calculate_virtual_tracks(depth, extrinsics, intrinsics, valid)[0]
++        return scores, tracks
++
++    scores_1, tracks_1 = run(1.0)
++    scores_8, tracks_8 = run(8.0)
++    assert scores_1[0, 1] > 0
++    torch.testing.assert_close(scores_8, scores_1, atol=1e-4, rtol=1e-4)
++    torch.testing.assert_close(tracks_8, tracks_1, atol=1e-3, rtol=1e-4, equal_nan=True)
++
++
++def test_worker_failure_reports_stderr(tmp_path):
++    with pytest.raises(ValueError):
++        Amb3rWorkerClient(sys.executable, str(tmp_path / "missing"), str(tmp_path / "missing.pt"))
++    source = tmp_path / "source"
++    source.mkdir()
++    checkpoint = tmp_path / "empty.pt"
++    checkpoint.write_bytes(b"")
++    with pytest.raises(RuntimeError, match="amb3r"):
++        Amb3rWorkerClient(sys.executable, str(source), str(checkpoint))
+diff --git a/tests/test_colmap_gt_intrinsics.py b/tests/test_colmap_gt_intrinsics.py
+new file mode 100644
+index 0000000..b87f9b9
+--- /dev/null
++++ b/tests/test_colmap_gt_intrinsics.py
+@@ -0,0 +1,55 @@
++import logging
++from types import SimpleNamespace
++
++import numpy as np
++
++from gluemap.utils import colmap
++
++
++class _FakeCamera:
++    def __init__(self, focal_length):
++        self.focal_length = focal_length
++
++    def calibration_matrix(self):
++        return np.asarray(
++            [
++                [self.focal_length, 0.0, 320.0],
++                [0.0, self.focal_length, 240.0],
++                [0.0, 0.0, 1.0],
++            ]
++        )
++
++
++class _FakeReconstruction:
++    def __init__(self):
++        self.cameras = {
++            10: _FakeCamera(500.0),
++            20: _FakeCamera(600.0),
++            30: _FakeCamera(700.0),
++        }
++        self.images = {
++            1: SimpleNamespace(name="S00/000000.jpg", camera_id=10),
++            2: SimpleNamespace(name="S01/000001.jpg", camera_id=20),
++            3: SimpleNamespace(name="S02/000002.jpg", camera_id=30),
++        }
++
++    def read(self, _gt_path):
++        return None
++
++
++def test_gt_intrinsics_allocates_by_camera_ids_not_image_indices(
++    monkeypatch, caplog
++):
++    image_count = 1414
++    images_list = [f"S{i % 3:02d}/{i:06d}.jpg" for i in range(image_count)]
++    intrinsics_mapping = {i: i % 3 for i in range(image_count)}
++    monkeypatch.setattr(colmap.pycolmap, "Reconstruction", _FakeReconstruction)
++
++    with caplog.at_level(logging.INFO, logger=colmap.__name__):
++        result = colmap.extract_gt_intrinsics(
++            "/unused/fake-model", images_list, intrinsics_mapping
++        )
++
++    assert len(result) == 3
++    assert all(intrinsics is not None for intrinsics in result)
++    assert "GT intrinsics loaded: 3/3 cameras matched" in caplog.text
+diff --git a/tests/test_multi_sequence_extra_pairs.py b/tests/test_multi_sequence_extra_pairs.py
+new file mode 100644
+index 0000000..74c0885
+--- /dev/null
++++ b/tests/test_multi_sequence_extra_pairs.py
+@@ -0,0 +1,68 @@
++import argparse
++
++import numpy as np
++import torch
++from PIL import Image
++
++from gluemap.datasets import multi_sequence_twoview as multi
++
++
++def test_all_forced_pairs_resolve_through_the_real_constructor(
++    tmp_path, monkeypatch
++):
++    images_root = (tmp_path / "images").resolve()
++    for sequence, count in (("S01", 100), ("S02", 60)):
++        sequence_dir = images_root / sequence
++        sequence_dir.mkdir(parents=True)
++        for index in range(count):
++            Image.new("RGB", (32, 18), color=(index % 255, 1, 2)).save(
++                sequence_dir / f"{index:06d}.jpg"
++            )
++
++    forced_pairs_path = tmp_path / "forced_bridges.txt"
++    forced_lines = []
++    for i in range(100):
++        for j in range(60):
++            prefix = "./" if (i + j) % 2 else ""
++            forced_lines.append(
++                f"{prefix}S01/{i:06d}.jpg {prefix}S02/{j:06d}.jpg"
++            )
++    forced_pairs_path.write_text(
++        "\n".join(forced_lines) + "\n", encoding="utf-8"
++    )
++
++    def fake_descriptors(self, _args, _dataset, image_names):
++        count = len(image_names)
++        neighbors = np.arange(count, dtype=np.int64).reshape(count, 1)
++        descriptors = torch.zeros((count, 1), dtype=torch.float32)
++        return neighbors, descriptors
++
++    monkeypatch.setattr(
++        multi.MultiSequencePairs,
++        "_retrieve_descriptors_and_neighbors",
++        fake_descriptors,
++    )
++    monkeypatch.setattr(
++        multi,
++        "retrieve_global_neighbors",
++        lambda *_args, **_kwargs: np.empty((0, 2), dtype=np.int64),
++    )
++
++    args = argparse.Namespace(
++        images_path=str(images_root),
++        camera_model="PINHOLE",
++        curr_processed=str(tmp_path / "processed"),
++        num_neighbors_sequential=0,
++        intrinsics_mode="SHARED",
++        extra_pairs_path=str(forced_pairs_path),
++    )
++    dataset = multi.MultiSequencePairs(args, ["S01", "S02"])
++
++    expected_pairs = {(i, 100 + j) for i in range(100) for j in range(60)}
++    actual_pairs = {tuple(pair) for pair in dataset.pairs.tolist()}
++
++    assert dataset.images_path_root == str(images_root)
++    assert dataset.images_list[:2] == ["S01/000000.jpg", "S01/000001.jpg"]
++    assert len(expected_pairs) == 6000
++    assert actual_pairs == expected_pairs
++    assert all(i < j for i, j in actual_pairs)
+diff --git a/tests/test_omega_covisibility.py b/tests/test_omega_covisibility.py
+new file mode 100644
+index 0000000..726cab9
+--- /dev/null
++++ b/tests/test_omega_covisibility.py
+@@ -0,0 +1,53 @@
++import torch
++
++from gluemap.estimators.covisibility_extraction import CovisibilityExtraction
++
++
++def _scene(height=32, width=32):
++    extrinsics = torch.eye(4)[None, None].expand(1, 2, -1, -1).clone()
++    intrinsics = torch.tensor(
++        [[20.0, 0.0, width / 2], [0.0, 20.0, height / 2], [0.0, 0.0, 1.0]]
++    )[None, None].expand(1, 2, -1, -1).clone()
++    depth = torch.linspace(1.0, 3.0, height * width).reshape(1, 1, height, width, 1)
++    return depth.expand(1, 2, -1, -1, -1), extrinsics, intrinsics
++
++
++def test_disjoint_confidence_masks_do_not_support_an_edge():
++    depth, extrinsics, intrinsics = _scene()
++    extractor = CovisibilityExtraction(virtual_stride=16)
++    world = extractor._convert_from_depth_to_world_points(depth, extrinsics, intrinsics)
++    mask = torch.zeros((1, 2, 32, 32), dtype=torch.bool)
++    mask[:, 0, :, :16] = True
++    mask[:, 1, :, 16:] = True
++    scores, valid = extractor._verify_by_reprojection_n2(
++        world, extrinsics, intrinsics, depth_valid_mask=mask
++    )
++    assert scores[0, 1] == 0
++    assert not valid[:, 1].any()
++
++
++def test_no_confident_depth_yields_no_neighbor_support():
++    depth, extrinsics, intrinsics = _scene()
++    extractor = CovisibilityExtraction(virtual_stride=16)
++    world = extractor._convert_from_depth_to_world_points(depth, extrinsics, intrinsics)
++    scores, valid = extractor._verify_by_reprojection_n2(
++        world, extrinsics, intrinsics,
++        depth_valid_mask=torch.zeros((1, 2, 32, 32), dtype=torch.bool),
++    )
++    assert torch.isfinite(scores).all()
++    assert scores[0, 1] == 0
++    assert not valid.any()
++
++
++def test_omega_virtual_grid_uses_sixteen_pixel_stride():
++    depth, extrinsics, intrinsics = _scene(288, 512)
++    extractor = CovisibilityExtraction(virtual_stride=16)
++    valid = torch.ones((1, 2, 288, 512), dtype=torch.bool)
++    tracks, _, _, _ = extractor._calculate_virtual_tracks(
++        depth, extrinsics, intrinsics, valid
++    )
++    grid_x, grid_y = torch.meshgrid(
++        torch.arange(8, 512, 16), torch.arange(8, 288, 16), indexing="xy"
++    )
++    expected = torch.stack((grid_x, grid_y), dim=-1).reshape(576, 2).float()
++    torch.testing.assert_close(tracks[0, 0], expected, atol=1e-4, rtol=1e-5)

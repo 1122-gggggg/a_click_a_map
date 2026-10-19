@@ -1,0 +1,22 @@
+diff --git a/src/utils/misc.py b/src/utils/misc.py
+index 3549225..f89b690 100644
+--- a/src/utils/misc.py
++++ b/src/utils/misc.py
+@@ -7,7 +7,16 @@ from itertools import chain
+ 
+ import torch
+ from yacs.config import CfgNode as CN
+-from lightning.pytorch.utilities import rank_zero_only
++try:  # VENDORED: training-only dep; inference must not require lightning.
++    from lightning.pytorch.utilities import rank_zero_only
++except ModuleNotFoundError:  # pragma: no cover
++    class _RankZeroOnly:
++        rank = 0
++
++        def __call__(self, fn):
++            return fn
++
++    rank_zero_only = _RankZeroOnly()
+ 
+ 
+ def lower_config(yacs_cfg):
