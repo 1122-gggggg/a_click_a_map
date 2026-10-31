@@ -320,10 +320,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         encoding="utf-8",
     )
     check_no_source_paths(stage=stage, report=report)
+    write_json(stage / "provenance.json", provenance)
     manifest_receipt = write_manifest(stage=stage, map_name=map_name,
                                       bundle_weights=bool(args.bundle_weights))
     report["manifest"] = {"schema": MANIFEST_SCHEMA, **manifest_receipt}
-    write_json(stage / "provenance.json", {**provenance, "report": report})
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "LOCALIZATION_BUNDLE_BUILT",
