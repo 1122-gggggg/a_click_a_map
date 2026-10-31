@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the MoGe-3 toolkit under third_party/moge3 (idempotent).
-#   moge3/scripts/setup.sh [--no-envs] [--no-weights]
+#   moge3/scripts/setup.sh [--no-envs] [--no-weights] [--no-sources]
+#   --no-sources: the third_party/moge3 tree (repo, resources, weights) is already present, e.g. the delivered package; only build envs
 # Layout it creates (read by run_moge3.sh / moge3/portable_pipeline/run_pipeline.py):
 #   third_party/moge3/repo        colmap/gluemap @ pinned commit + patches/gluemap-moge3-megaloc.patch + MoGe-3 + MegaLoc
 #   third_party/moge3/resources   edm (patched), megaloc, mvsformerpp (SDPA patch), normal_map_pipeline, river_map_quality
@@ -14,9 +15,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 M3="$ROOT/moge3"
 TK="${MOGE3_TOOLKIT:-$ROOT/third_party/moge3}"
 CFG="$M3/configs/versions.json"
-ENVS=1; WEIGHTS=1
+ENVS=1; WEIGHTS=1; SOURCES=1
 for arg in "$@"; do
-  case "$arg" in --no-envs) ENVS=0 ;; --no-weights) WEIGHTS=0 ;; *) echo "unknown option $arg" >&2; exit 2 ;; esac
+  case "$arg" in --no-envs) ENVS=0 ;; --no-weights) WEIGHTS=0 ;; --no-sources) SOURCES=0 ;; *) echo "unknown option $arg" >&2; exit 2 ;; esac
 done
 cfg() { python3 - "$CFG" "$@" <<'E'
 import json, sys
@@ -37,6 +38,7 @@ apply_patch() { # dir patch
 }
 mkdir -p "$TK/resources" "$TK/weights" "$TK/envs"
 
+if [ "$SOURCES" = 1 ]; then
 echo "[1/4] GlueMap (colmap/gluemap @ $(cfg sources.gluemap.commit | cut -c1-9)) + MoGe-3 / MegaLoc patch"
 clone_pinned "$(cfg sources.gluemap.url)" "$TK/repo" "$(cfg sources.gluemap.commit)"
 git -C "$TK/repo" submodule update --init --recursive -- $(python3 -c "import json;print(' '.join(json.load(open('$CFG'))['sources']['gluemap']['submodules']))")
@@ -53,6 +55,7 @@ git -C "$TK/resources/mvsformerpp" checkout --quiet "$(cfg sources.mvsformerpp.c
 apply_patch "$TK/resources/mvsformerpp" "$ROOT/$(cfg sources.mvsformerpp.patch)"
 ln -sfn "$ROOT/pipeline/src" "$TK/resources/normal_map_pipeline"
 ln -sfn "$ROOT/pipeline/compat_src" "$TK/resources/river_map_quality"
+fi
 
 if [ "$ENVS" = 1 ]; then
   echo "[3/4] environments"

@@ -21,6 +21,7 @@ export ACAM_MVS_CHECKPOINT=/path/tnt_ckpt/model_best.pth   # MVSFormer++ 官方 
 export ACAM_MVS_CONFIG=/path/tnt_ckpt/config.json
 moge3/scripts/setup.sh                 # 產生 third_party/moge3/{repo,resources,weights,envs}
 moge3/scripts/setup.sh --no-envs       # 只抓程式與 patch（不建環境）
+moge3/scripts/setup.sh --no-sources --no-weights   # third_party/moge3 已備妥（例如結案包）時，只建環境
 ```
 
 釘住的來源與權重 sha256 在 `moge3/configs/versions.json`；`setup.sh` 會 clone 上游 `colmap/gluemap@adc9e4b` 並套用 patch，
