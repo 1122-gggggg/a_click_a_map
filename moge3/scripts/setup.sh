@@ -72,12 +72,14 @@ if [ "$ENVS" = 1 ]; then
   "$E/gluemap/bin/python" -c "import torch,pycolmap,pygluemap; print('gluemap env ok', torch.__version__, pycolmap.__version__)"
   if [ ! -x "$E/moge/bin/python" ]; then
     uv venv --python 3.11 "$E/moge"
-    uv pip install --python "$E/moge/bin/python" --extra-index-url https://download.pytorch.org/whl/cu130 -r "$SPEC/moge.requirements.txt"
+    uv pip install --python "$E/moge/bin/python" --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu130 -r "$SPEC/moge.requirements.txt" \
+      || { rm -rf "$E/moge"; echo "moge env install failed; removed the partial env, fix the error above and re-run" >&2; exit 1; }
   fi
-  "$E/moge/bin/python" -c "import torch,flex_gemm,utils3d; print('moge env ok', torch.__version__)"
+  "$E/moge/bin/python" -c "import torch,flex_gemm,utils3d_moge; print('moge env ok', torch.__version__)"
   if [ ! -x "$E/mvs/bin/python" ]; then
     uv venv --python 3.12 "$E/mvs"
-    uv pip install --python "$E/mvs/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 -r "$SPEC/mvs.requirements.txt"
+    uv pip install --python "$E/mvs/bin/python" --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu128 -r "$SPEC/mvs.requirements.txt" \
+      || { rm -rf "$E/mvs"; echo "mvs env install failed; removed the partial env, fix the error above and re-run" >&2; exit 1; }
   fi
   "$E/mvs/bin/python" -c "import torch,cv2,timm; print('mvs env ok', torch.__version__)"
 fi
