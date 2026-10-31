@@ -1,0 +1,2305 @@
+diff --git a/.gitignore b/.gitignore
+index 59f208a..2168e57 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,4 +3,5 @@ pybind_build/
+ results/
+ venv_gluemap/
+ 
+-*.pyc
+\ No newline at end of file
++*.pyc
++.build-tmp/
+\ No newline at end of file
+diff --git a/.gitmodules b/.gitmodules
+index 1de01a0..9aaed0d 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,6 +1,3 @@
+-[submodule "thirdparty/salad"]
+-	path = thirdparty/salad
+-	url = https://github.com/serizba/salad.git
+ [submodule "thirdparty/doppelgangers-plusplus"]
+ 	path = thirdparty/doppelgangers-plusplus
+ 	url = https://github.com/doppelgangers25/doppelgangers-plusplus.git
+@@ -13,3 +10,9 @@
+ [submodule "thirdparty/mapanything"]
+ 	path = thirdparty/mapanything
+ 	url = https://github.com/facebookresearch/map-anything.git
++[submodule "thirdparty/megaloc"]
++	path = thirdparty/megaloc
++	url = https://github.com/gmberton/MegaLoc.git
++[submodule "thirdparty/moge"]
++	path = thirdparty/moge
++	url = https://github.com/microsoft/MoGe.git
+diff --git a/INSTALL.md b/INSTALL.md
+index b930799..43bb796 100644
+--- a/INSTALL.md
++++ b/INSTALL.md
+@@ -13,10 +13,35 @@ git submodule update --init --recursive
+ ```
+ 
+ The submodules under `thirdparty/` (pi3, vggt, mapanything,
+-doppelgangers-plusplus, salad) are required at runtime — they are added
++doppelgangers-plusplus, megaloc) are required at runtime — they are added
+ to `sys.path` by `thirdparty/path_to_thirdparty.py`. Skipping this step
+ will cause `ImportError` on first run.
+ 
++`thirdparty/moge` is imported only by the standalone MoGe-3 depth worker.
++Set `path_depth` to a local MoGe-3 `model.pt` or an HF repository ID
++(default `Ruicheng/moge-3-vitl`). Set `moge_python` to an interpreter with
++MoGe-3's torch, flex_gemm, utils3d_moge, OpenCV, SciPy and huggingface_hub
++dependencies; an empty value uses the pipeline interpreter. The pinned
++MoGe-3 refiner requires a compatible torch/Triton stack: on the Wulai
++machine it works with torch 2.13.0+cu130, not torch 2.7.1/Triton 3.3.1.
++The worker keeps that stack separate from GLUEMAP's torch 2.7.1+cu128.
++
++Star inference crops away canvas padding before MoGe-3 inference, solves
++the depth shift from each star's backbone focal length, and aligns scale
++using the confident half of valid depth pixels. Padding, invalid MoGe
++pixels and images without sufficient alignment support retain backbone
++depth; backbone poses, intrinsics and confidence remain unchanged.
++
++For an isolated overlay on an existing CUDA-capable environment, create a
++`uv venv --system-site-packages --python /path/to/base/python /path/to/venv`
++and install this checkout with `uv pip install --python /path/to/venv/bin/python
++--no-deps --no-build-isolation -e .`. Install build/runtime dependencies in the
++overlay first; `--no-deps` preserves the base environment's PyTorch build.
++In particular, install the declared `kornia==0.8.2` in the overlay if the base
++has 0.8.3: VGGSfM imports `kornia.utils.grid`, which 0.8.3 no longer provides.
++The `thirdparty` package is checkout-local, so another editable GLUEMAP
++installation in the base environment cannot supply this fork's submodules.
++
+ ## 2. Install C/C++ build dependencies
+ 
+ You need development headers + CMake configs for:
+@@ -117,7 +142,7 @@ upstream release:
+ | Config key | File | Source |
+ |---|---|---|
+ | `path_feedforward` | `pi3.safetensors` | HF `yyfz233/Pi3` |
+-| `path_retrieval` | `dino_salad.ckpt` | github.com/serizba/salad release `v1.0.0` |
++| `path_retrieval` | `megaloc.safetensors` | HF `gberton/MegaLoc` (`model.safetensors`, renamed) |
+ | `path_tracker` | `vggsfm_v2_0_0_track_predictor.bin` | HF `facebook/VGGSfM` (`vggsfm_v2_tracker.pt`, renamed) |
+ | `path_dg` | `checkpoint-dg+visym.pth` | HF `doppelgangers25/doppelgangers_plusplus` |
+ 
+@@ -126,9 +151,9 @@ Quickest setup from the repo root:
+ ```
+ mkdir -p checkpoints
+ 
+-# SALAD retrieval
+-wget -O checkpoints/dino_salad.ckpt \
+-    https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt
++# MegaLoc retrieval
++hf download gberton/MegaLoc model.safetensors --local-dir checkpoints
++mv checkpoints/model.safetensors checkpoints/megaloc.safetensors
+ 
+ # VGGSfM tracker (renamed to match base.yaml)
+ wget -O checkpoints/vggsfm_v2_0_0_track_predictor.bin \
+@@ -143,6 +168,9 @@ hf download doppelgangers25/doppelgangers_plusplus \
+     checkpoint-dg+visym.pth --local-dir checkpoints
+ ```
+ 
++DG++ checkpoints contain a pickled `argparse.Namespace`. The loader explicitly
++allowlists that type for PyTorch >= 2.6 rather than disabling weights-only loading.
++
+ If you switch `chosen_model` to `vggt` or `map_anything`, fetch the
+ matching backbone instead of `pi3.safetensors`:
+ 
+diff --git a/README.md b/README.md
+index fbc51ac..6d82c9b 100644
+--- a/README.md
++++ b/README.md
+@@ -12,9 +12,9 @@ It pairs their resilience on hard local geometry (low overlap, repetitive struct
+ 
+ The pipeline comprises:
+ 
+-1. **Retrieval** — SALAD global descriptors build the image neighbor graph.
++1. **Retrieval** — MegaLoc global descriptors build the image neighbor graph.
+ 2. **Two-view inference (optional)** — Doppelgangers++ (MAST3R-based) estimates covisibility of pairs. Can be skipped via `skip_doppelgangers` when the scene has no repetitive structure or when a quick result is preferred (see [Configuration](#configuration)).
+-3. **Multi-view inference** — a configurable backbone (Pi3 / Pi3X / VGGT / MapAnything) estimates poses and geometry in local star configurations.
++3. **Multi-view inference** — a configurable backbone (Pi3 / Pi3X / VGGT / MapAnything) estimates poses and intrinsics in local star configurations; MoGe-3 ViT-L replaces depth after per-image robust scale alignment.
+ 4. **Global mapping** — rotation averaging, intrinsics averaging,
+    similarity averaging, and global bundle adjustment fuse the local solutions.
+ 5. **Refinement** — SIFT track snapping with iterative augmented bundle adjustment.
+@@ -51,8 +51,8 @@ CMAKE_PREFIX_PATH=$CONDA_PREFIX pip install -e .
+ For the reproducible conda/micromamba recipe (pinned versions, CUDA
+ notes, libstdc++ ABI troubleshooting), see [INSTALL.md](INSTALL.md).
+ 
+-The default config expects four model checkpoints under `checkpoints/`
+-(Pi3, SALAD, VGGSfM tracker, Doppelgangers++). Download commands are in
++The default config uses four local model checkpoints under `checkpoints/`
++(Pi3, MegaLoc, VGGSfM tracker, Doppelgangers++) plus `Ruicheng/moge-3-vitl`. Download commands are in
+ [INSTALL.md §4](INSTALL.md#4-download-model-checkpoints).
+ 
+ Verify the install:
+@@ -94,6 +94,44 @@ gluemap-demo \
+ 
+ This auto-enables sequential pairing within each subfolder.
+ 
++### Wulai calibrated all-9 reconstruction
++
++`configs/wulai_all9.yaml` reuses the existing 2,043 already-undistorted
++`vid_*/frame_*.jpg` keyframes; it performs no image undistortion or extraction.
++It uses Pi3 poses/intrinsics, MegaLoc retrieval, MoGe-3 ViT-L depth,
++512 tracks/image and fixed calibrated PINHOLE intrinsics shared by resolution.
++Before running, copy `cameras.txt`, `images.txt` and `points3D.txt` from the
++prior run's `intrinsics_seed` into `results/wulai_intrinsics_seed/`.
++The config records the machine-local checkpoint, keyframe and worker paths.
++`num_workers: 0` avoids parallel original-resolution star loads: the initial
++two-worker smoke run was killed by the system RAM OOM killer before its first
++star completed. Run inside a memory-limited systemd scope on shared machines.
++
++```bash
++HF_HUB_OFFLINE=1 /home/cihcilab/venvs/new-gluemap/bin/gluemap-demo \
++    --config configs/wulai_all9.yaml
++```
++
++Final COLMAP output: `results/wulai_all9_moge3_megaloc/gluemap_aba/`
++(coarse model: `coarse/`). `force_load: true` reuses completed retrieval,
++two-view, star and database stages when restarting the same run.
++Only Pi3 is exercised end to end on this machine; VGGT and MapAnything
++are covered by the wrapper's canvas/shape contract, not checkpoint inference.
++
++The mixed-resolution, 60-image smoke test registered all 60 images with
++38,291 points and 1.148 px mean reprojection error. Its two cameras stayed
++bit-identical to the coarse model and within 0.000060 px of the calibration
++seed. MoGe forwarded each image once (60 forwards for 1,560 requested maps),
++with zero alignment fallbacks. Machine-readable verification and the
++12-image depth-effect diagnostic are saved under `results/`.
++
++The full 2,043-keyframe map registered all images (2,043/2,043) with
++1,251,814 points and 2.151 px mean reprojection error. All three PINHOLE
++cameras stayed within 0.00012 px of the calibration seed. MoGe forwarded each
++image once (2,043 forwards for 51,370 requested maps) with zero alignment
++fallbacks. The refinement stage peaked above 18 GiB of RAM; use a cap of at
++least 24 GiB for this scene.
++
+ ### Multi-GPU
+ 
+ Two-view and star-inference stages parallelize across ranks via
+@@ -121,9 +159,12 @@ The most-touched knobs:
+ | `images_path` / `write_path` | Input directory / output directory. |
+ | `chosen_model` | Multi-view backbone: `pi3` (default), `pi3x`, `vggt`, `map_anything`. |
+ | `path_feedforward` | Checkpoint for the chosen multi-view model. |
+-| `path_retrieval` / `path_tracker` / `path_dg` | SALAD / VGGSfM / Doppelgangers++ checkpoints. |
++| `path_retrieval` / `path_tracker` / `path_dg` | MegaLoc / VGGSfM / Doppelgangers++ checkpoints. |
++| `path_depth` / `moge_python` | MoGe-3 checkpoint (local file or HF repo ID) and optional separate worker interpreter. |
+ | `camera_model` | COLMAP camera model (default `SIMPLE_PINHOLE`). |
+ | `intrinsics_mode` | Intrinsics-bucketing strategy: `SHARED` (one camera per unique image shape, default), `PER_FOLDER` (one camera per `(dirname, shape)` pair), or `PER_CAMERA` (one camera per image). |
++| `refine_intrinsics` | Refine camera parameters during BA (default `true`); `false` fixes seeded/GT intrinsics in real and virtual residuals. |
++| `checkpoint_every` | Save a resumable `*.partial` result every N inference batches (default `0`, off; ignored with multiple GPUs). A rerun with `force_load` continues from the last checkpoint; the file is removed when the stage finishes. |
+ | `num_neighbors` | Neighbors per image in the retrieval graph (default `100`). |
+ | `is_sequential` / `sample_frequency` | Use temporal pairing for ordered video; subsample every Nth frame. |
+ | `is_multi_sequence` / `subfolder_regex` | Process several sibling sequences into a single reconstruction. |
+@@ -166,6 +207,11 @@ The contract:
+   read additional keys.
+ - **Output** dict with at minimum `depth`, `depth_conf`, `extrinsics`,
+   `intrinsics`.
++- Star depth replacement requires `depth` at the input canvas resolution,
++  shape `(B, N, H, W, 1)`. CPU regressions cover content-box coordinates,
++  robust scale alignment, padding/invalid-pixel preservation, anisotropic
++  PINHOLE normalization and fixed intrinsics with real/virtual BA residuals:
++  `python -m pytest tests -q`.
+ 
+ Use the existing wrappers as references:
+ 
+@@ -193,7 +239,8 @@ GLUEMAP stands on a stack of upstream feed-forward and geometry models:
+ 
+ - [COLMAP](https://github.com/colmap/colmap) — output format and broader SfM ecosystem
+ - [Doppelgangers++](https://github.com/doppelgangers25/doppelgangers-plusplus) — two-view disambiguator (with MAST3R / DUSt3R / CroCo)
+-- [SALAD](https://github.com/serizba/salad) — DINO-based image retrieval
++- [MegaLoc](https://github.com/gmberton/MegaLoc) — 8448-dimensional, L2-normalized image retrieval
++- [MoGe-3](https://github.com/microsoft/MoGe) — FOV-conditioned depth, scale-aligned to the multi-view backbone
+ - [VGGSfM](https://github.com/facebookresearch/vggsfm) — point tracker
+ - [LightGlue](https://github.com/cvg/LightGlue) — feature extractor
+ 
+diff --git a/benchmark/run_benchmark.py b/benchmark/run_benchmark.py
+index a13704f..1ed276d 100644
+--- a/benchmark/run_benchmark.py
++++ b/benchmark/run_benchmark.py
+@@ -156,7 +156,7 @@ def run_single_dataset(
+         dtype: Torch dtype
+         images_list: Optional list of image filenames to use (None means all
+             images)
+-        preprocess_path: Optional path for scene-level preprocessing (SALAD
++        preprocess_path: Optional path for scene-level preprocessing (MegaLoc
+             features). If provided, experiments in the same scene share
+             preprocessed features.
+ 
+@@ -181,7 +181,7 @@ def run_single_dataset(
+     # Resolve use_gt_intrinsics: set gt_intrinsics_path from gt_path
+     if getattr(args, "use_gt_intrinsics", False) and gt_path:
+         args.gt_intrinsics_path = gt_path
+-    # Use preprocess_path for SALAD features if provided, else use write_path
++    # Use preprocess_path for MegaLoc features if provided, else use write_path
+     args.curr_processed = (
+         preprocess_path if preprocess_path else args.write_path
+     )
+@@ -227,7 +227,7 @@ def run_single_dataset(
+     else:
+         # Standard single-dataset mode
+         if getattr(args, "direct_inference", False):
+-            # Skip SALAD preprocessing for direct backbone inference
++            # Skip MegaLoc preprocessing for direct backbone inference
+             dataset_timing["preprocessing"] = {"total": 0.0}
+         else:
+             (_, _), preproc_timing = run_preprocessing_pipeline(
+diff --git a/benchmark/utils.py b/benchmark/utils.py
+index 75953c8..66dece0 100644
+--- a/benchmark/utils.py
++++ b/benchmark/utils.py
+@@ -132,7 +132,7 @@ def load_experiments(
+         output_pattern: Pattern for output path with {scene}/{exp_name}
+             placeholders
+         preprocess_pattern: Optional pattern for scene-level preprocessing path
+-            with {scene} placeholder. SALAD features will be shared across
++            with {scene} placeholder. MegaLoc features will be shared across
+             experiments in the same scene.
+ 
+     Returns:
+@@ -183,7 +183,7 @@ def load_experiments(
+                     .replace("{benchmark}", benchmark_name)
+                 )
+ 
+-                # Scene-level preprocess path for SALAD feature reuse
++                # Scene-level preprocess path for MegaLoc feature reuse
+                 preprocess_path = None
+                 if preprocess_pattern:
+                     preprocess_path = preprocess_pattern.replace(
+diff --git a/configs/base.yaml b/configs/base.yaml
+index 15cd0e2..c0082ee 100644
+--- a/configs/base.yaml
++++ b/configs/base.yaml
+@@ -8,9 +8,12 @@ chosen_model: pi3   # pi3, pi3x, vggt, map_anything
+ 
+ # Model paths
+ path_feedforward: checkpoints/pi3.safetensors
+-path_retrieval:   checkpoints/dino_salad.ckpt
++path_retrieval:   checkpoints/megaloc.safetensors
+ path_tracker:     checkpoints/vggsfm_v2_0_0_track_predictor.bin
+ path_dg:          checkpoints/checkpoint-dg+visym.pth
++path_depth:       Ruicheng/moge-3-vitl
++# Interpreter with MoGe-3's torch/flex_gemm stack; empty uses this interpreter.
++moge_python: ""
+ 
+ # IO (images_path / write_path are set in the demo or benchmark config)
+ temp_path: ./tmp
+@@ -39,6 +42,9 @@ coarse_only: false
+ use_dummy_tracks: false
+ skip_doppelgangers: false
+ 
++# Bundle adjustment
++refine_intrinsics: true
++
+ # Ground truth intrinsics
+ use_gt_intrinsics: false
+ 
+diff --git a/configs/wulai_all9.yaml b/configs/wulai_all9.yaml
+new file mode 100644
+index 0000000..f74ce3b
+--- /dev/null
++++ b/configs/wulai_all9.yaml
+@@ -0,0 +1,26 @@
++_base_: base.yaml
++images_path: /home/cihcilab/sfm/runs/wulai_gluemap_all9_direct_20261019/artifacts/keyframes/images
++write_path: /mnt/newdisk/new_gluemap/results/wulai_all9_moge3_megaloc
++temp_path: /mnt/newdisk/new_gluemap/results/wulai_all9_moge3_megaloc/tmp
++chosen_model: pi3
++path_feedforward: /home/cihcilab/sfm/runtime/gluemap/checkpoints/pi3.safetensors
++path_retrieval: /home/cihcilab/sfm/runtime/megaloc/model/model.safetensors
++path_tracker: /home/cihcilab/sfm/runtime/gluemap/checkpoints/vggsfm_v2_0_0_track_predictor.bin
++path_dg: /home/cihcilab/sfm/runtime/gluemap/checkpoints/checkpoint-dg+visym.pth
++path_depth: /home/cihcilab/.cache/huggingface/hub/models--Ruicheng--moge-3-vitl/snapshots/184008f877d7ad1ad4c2cd2182a9bd1f63d0e5be/model.pt
++moge_python: /home/cihcilab/sfm/runtime/moge3/.venv/bin/python
++is_multi_sequence: true
++subfolder_regex: ".*"
++camera_model: PINHOLE
++intrinsics_mode: SHARED
++gt_intrinsics_path: /mnt/newdisk/new_gluemap/results/wulai_intrinsics_seed
++refine_intrinsics: false
++num_track_per_img: 512
++num_neighbors: 20
++num_neighbors_sequential: 9
++batch_size: 1
++retrieval_batch_size: 10
++# Avoid concurrent full-resolution star loads and DataLoader fork/prefetch peaks.
++num_workers: 0
++checkpoint_every: 100
++force_load: true
+diff --git a/gluemap/controllers/augmented_bundle_adjustment.py b/gluemap/controllers/augmented_bundle_adjustment.py
+index b745295..b8ef5f4 100644
+--- a/gluemap/controllers/augmented_bundle_adjustment.py
++++ b/gluemap/controllers/augmented_bundle_adjustment.py
+@@ -241,6 +241,7 @@ class IterativeBAOptions:
+ 
+     # Whether to filter virtual points same as real tracks
+     filter_virtual_points: bool = True
++    refine_intrinsics: bool = True
+ 
+ 
+ def prune_track_outliers(
+@@ -548,6 +549,7 @@ def iterative_bundle_adjustment(
+             virtual_reconstruction,
+             negative_depth_observations,
+             max_num_iterations=options.max_ba_iterations,
++            refine_intrinsics=options.refine_intrinsics,
+         )
+ 
+         # Inner loop: filter and tighten threshold when too few tracks filtered
+diff --git a/gluemap/controllers/base_inference.py b/gluemap/controllers/base_inference.py
+index 9d50e27..06387e2 100644
+--- a/gluemap/controllers/base_inference.py
++++ b/gluemap/controllers/base_inference.py
+@@ -155,21 +155,66 @@ class BaseInferencePipeline(abc.ABC):
+         if torch.cuda.is_available():
+             torch.cuda.empty_cache()
+ 
++    def _partial_path(self) -> str:
++        return os.path.join(
++            self.args.curr_path, self.file_name + ".partial"
++        )
++
++    def _checkpoint_every(self) -> int:
++        """Batches between partial checkpoints; 0 disables (always 0 when
++        distributed, since ranks would need coordinated resume)."""
++        if self.args.distributed:
++            return 0
++        return int(getattr(self.args, "checkpoint_every", 0) or 0)
++
++    def _save_partial(
++        self,
++        all_outputs: list[dict],
++        all_indices: list[int],
++        batch_times: list[float],
++        extra_timings: dict[str, list[float]],
++        dataset_size: int,
++    ) -> None:
++        path = self._partial_path()
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        tmp = path + ".tmp"
++        torch.save(
++            {
++                "outputs": all_outputs,
++                "indices": all_indices,
++                "batch_times": batch_times,
++                "extra_timings": extra_timings,
++                "dataset_size": dataset_size,
++            },
++            tmp,
++        )
++        os.replace(tmp, path)
++
+     def _run_inference(
+-        self, data_loader: torch.utils.data.DataLoader
++        self,
++        data_loader: torch.utils.data.DataLoader,
++        state: dict | None = None,
++        dataset_size: int = 0,
+     ) -> tuple[
+         list[dict], list[int], list[float], dict[str, list[float]], float
+     ]:
+         """Iterate ``data_loader`` and run inference batch-by-batch.
+ 
++        ``state`` carries a previously saved partial checkpoint whose
++        results are prepended; the loader must then cover only the
++        remaining items.
++
+         Returns ``(all_outputs, all_indices, batch_times, extra_timings,
+         t_model_load)``.
+         """
+-        all_outputs: list[dict] = []
+-        all_indices: list[int] = []
+-        batch_times: list[float] = []
+-        extra_timings: dict[str, list[float]] = {}
+-
++        state = state or {}
++        all_outputs: list[dict] = list(state.get("outputs", []))
++        all_indices: list[int] = list(state.get("indices", []))
++        batch_times: list[float] = list(state.get("batch_times", []))
++        extra_timings: dict[str, list[float]] = {
++            k: list(v) for k, v in state.get("extra_timings", {}).items()
++        }
++        every = self._checkpoint_every()
+         t0_load = time.perf_counter()
+         models = self._load_models()
+         t_model_load = time.perf_counter() - t0_load
+@@ -198,6 +243,14 @@ class BaseInferencePipeline(abc.ABC):
+                 all_indices.extend(
+                     batch[self._index_key].cpu().numpy().tolist()
+                 )
++                if every and len(all_outputs) % every == 0:
++                    self._save_partial(
++                        all_outputs,
++                        all_indices,
++                        batch_times,
++                        extra_timings,
++                        dataset_size,
++                    )
+ 
+         return (
+             all_outputs,
+@@ -243,27 +296,51 @@ class BaseInferencePipeline(abc.ABC):
+ 
+         rerun = getattr(args, "rerun_from", None)
+         trig = self._rerun_from_triggers
+-        if (
+-            rerun is not None
+-            and (trig is None or rerun in trig)
+-            and os.path.exists(cache_path)
+-        ):
+-            os.remove(cache_path)
+-            logger.info(f"[rerun_from={rerun}] Deleted {cache_path}")
++        if rerun is not None and (trig is None or rerun in trig):
++            for stale in (cache_path, self._partial_path()):
++                if os.path.exists(stale):
++                    os.remove(stale)
++                    logger.info(f"[rerun_from={rerun}] Deleted {stale}")
+ 
+         batch_times: list[float] = []
+         extra_timings: dict[str, list[float]] = {}
+         t_model_load = 0.0
+ 
+         if not (args.force_load and os.path.exists(cache_path)):
+-            data_loader = self._make_dataloader(dataset)
++            state = None
++            partial = self._partial_path()
++            if os.path.exists(partial):
++                if self._checkpoint_every() and args.force_load:
++                    state = torch.load(partial, weights_only=False)
++                    done = len(state["indices"])
++                    if (
++                        state["dataset_size"] != len(dataset)
++                        or state["indices"] != list(range(done))
++                    ):
++                        logger.warning(
++                            f"Ignoring incompatible partial checkpoint {partial}"
++                        )
++                        state = None
++                    else:
++                        logger.info(
++                            f"Resuming {self._profiling_label} from "
++                            f"{done}/{len(dataset)} items ({partial})"
++                        )
++                if state is None:
++                    os.remove(partial)
++            loader_dataset = dataset
++            if state is not None:
++                loader_dataset = torch.utils.data.Subset(
++                    dataset, range(len(state["indices"]), len(dataset))
++                )
++            data_loader = self._make_dataloader(loader_dataset)
+             (
+                 all_outputs,
+                 all_indices,
+                 batch_times,
+                 extra_timings,
+                 t_model_load,
+-            ) = self._run_inference(data_loader)
++            ) = self._run_inference(data_loader, state, len(dataset))
+ 
+             global_outputs = self._gather_outputs(
+                 all_outputs, all_indices, dataset
+@@ -272,6 +349,8 @@ class BaseInferencePipeline(abc.ABC):
+             if self.rank == 0:
+                 os.makedirs(args.curr_path, exist_ok=True)
+                 torch.save(global_outputs, cache_path)
++                if os.path.exists(self._partial_path()):
++                    os.remove(self._partial_path())
+         else:
+             logger.info("Loading existing results...")
+             global_outputs = torch.load(cache_path, weights_only=False)
+diff --git a/gluemap/controllers/global_refinement.py b/gluemap/controllers/global_refinement.py
+index f5bb3b3..84ec091 100644
+--- a/gluemap/controllers/global_refinement.py
++++ b/gluemap/controllers/global_refinement.py
+@@ -371,6 +371,7 @@ def run_refinement_pipeline(
+         normalized_reproj_threshold=1e-2,
+         min_track_length=2,
+         fix_rotations_first_pass=False,
++        refine_intrinsics=getattr(args, "refine_intrinsics", True),
+     )
+ 
+     # Step 5: Build reconstruction from current data
+diff --git a/gluemap/controllers/image_retrieval.py b/gluemap/controllers/image_retrieval.py
+index cd6c671..5e5dfe7 100644
+--- a/gluemap/controllers/image_retrieval.py
++++ b/gluemap/controllers/image_retrieval.py
+@@ -4,18 +4,37 @@ import os
+ import time
+ 
+ import torch
++import torch.nn.functional as F
++from PIL import Image
++from torchvision import transforms as TF
+ from tqdm import tqdm
+ 
+-from gluemap.datasets.utils import get_image_list
++from gluemap.datasets.utils import RETRIEVAL_DESCRIPTORS_FILE, get_image_list
+ from gluemap.utils.gpu import synchronize
+-from gluemap.utils.load_fn import load_and_preprocess_images
+ from gluemap.utils.model_loader import load_models
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-class SaladRetrievalPipeline:
+-    """Pipeline object for SALAD-based image retrieval.
++def load_megaloc_images(image_paths: list[str]) -> torch.Tensor:
++    """Resize RGB images to MegaLoc's ImageNet-normalized 322px canvas."""
++    images = []
++    to_tensor = TF.ToTensor()
++    for path in image_paths:
++        with Image.open(path) as image:
++            x = to_tensor(image.convert("RGB")).unsqueeze(0)
++        x = F.interpolate(
++            x, size=(322, 322), mode="bilinear",
++            align_corners=False, antialias=True,
++        )
++        mean = x.new_tensor([0.485, 0.456, 0.406])[None, :, None, None]
++        std = x.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
++        images.append((x - mean) / std)
++    return torch.cat(images)
++
++
++class MegaLocRetrievalPipeline:
++    """Pipeline object for MegaLoc-based image retrieval.
+ 
+     Computes a global descriptor per image and caches it to disk. Follows the
+     same pattern as the other pipeline classes: stable config is stored as
+@@ -27,7 +46,7 @@ class SaladRetrievalPipeline:
+         args: argparse.Namespace,
+         world_size: int,
+         rank: int,
+-        file_name: str = "salad_descriptors.pt",
++        file_name: str = RETRIEVAL_DESCRIPTORS_FILE,
+         device: str = "cuda",
+         dtype: torch.dtype = torch.bfloat16,
+         models: dict[str, torch.nn.Module] | None = None,
+@@ -49,19 +68,19 @@ class SaladRetrievalPipeline:
+         t0 = time.perf_counter()
+         if (
+             self.preloaded_models is not None
+-            and "salad" in self.preloaded_models
++            and "megaloc" in self.preloaded_models
+         ):
+-            self.model = self.preloaded_models["salad"]
++            self.model = self.preloaded_models["megaloc"]
+             self.device = next(self.model.parameters()).device
+         else:
+-            loaded, self.device = load_models(self.args, keys={"salad"})
+-            self.model = loaded["salad"]
++            loaded, self.device = load_models(self.args, keys={"megaloc"})
++            self.model = loaded["megaloc"]
+             self._owns_model = True
+         self.model_loading_time = time.perf_counter() - t0
+         return self.model
+ 
+     def _release_model(self) -> None:
+-        """Free the SALAD model if we own it (i.e. not caller-supplied)."""
++        """Free the MegaLoc model if we own it (i.e. not caller-supplied)."""
+         if not self._owns_model or self.model is None:
+             return
+         del self.model
+@@ -82,7 +101,7 @@ class SaladRetrievalPipeline:
+ 
+     @torch.no_grad()
+     def _compute_descriptors(self) -> torch.Tensor:
+-        """Compute SALAD descriptors for every image under args.images_path."""
++        """Compute MegaLoc descriptors for every image under args.images_path."""
+         model = self._load_model()
+         batch_size = self.args.retrieval_batch_size
+         images_list = get_image_list(self.args.images_path)
+@@ -91,13 +110,13 @@ class SaladRetrievalPipeline:
+         N = len(images_list)
+         for i in tqdm(range(0, N, batch_size)):
+             num_img = min(N - i, batch_size)
+-            images, _, _ = load_and_preprocess_images(
+-                images_list[i : i + num_img],
+-                image_size=322,  # use the fixed 322 size for SALAD retrieval
+-                patch_size=14,
+-                force_square=True,
+-            )
+-            output = model(images.to(self.device)).cpu()
++            paths = images_list[i : i + num_img]
++            output = model(load_megaloc_images(paths).to(self.device)).float().cpu()
++            if output.shape != (num_img, 8448) or not torch.isfinite(output).all():
++                raise ValueError(
++                    f"MegaLoc must return finite ({num_img}, 8448) descriptors; "
++                    f"got {tuple(output.shape)}"
++                )
+             descriptors.append(output)
+ 
+         descriptors = torch.cat(descriptors)
+@@ -115,7 +134,7 @@ class SaladRetrievalPipeline:
+             os.path.join(base_path, file_name)
+         ):
+             if self.rank == 0:
+-                logger.info("Computing SALAD descriptors...")
++                logger.info("Computing MegaLoc descriptors...")
+                 descriptors = self._compute_descriptors()
+ 
+                 os.makedirs(base_path, exist_ok=True)
+@@ -131,7 +150,7 @@ class SaladRetrievalPipeline:
+ 
+         Returns:
+             ``((models_dict, device), timing)`` — ``models_dict`` maps
+-            ``"salad"`` to the loaded model (or ``None`` if it was released)
++            ``"megaloc"`` to the loaded model (or ``None`` if it was released)
+             and ``timing`` contains ``model_loading``, ``image_retrieval`` and
+             ``total`` seconds.
+         """
+@@ -158,7 +177,7 @@ class SaladRetrievalPipeline:
+             )
+ 
+         self._release_model()
+-        return ({"salad": self.model}, self.device), timing
++        return ({"megaloc": self.model}, self.device), timing
+ 
+     def run_multi(
+         self, datasets: list[str]
+@@ -214,18 +233,18 @@ class SaladRetrievalPipeline:
+             )
+ 
+         self._release_model()
+-        return ({"salad": self.model}, self.device), timing
++        return ({"megaloc": self.model}, self.device), timing
+ 
+ 
+ def run_preprocessing_pipeline(
+     args: argparse.Namespace,
+     world_size: int,
+     rank: int,
+-    file_name: str = "salad_descriptors.pt",
++    file_name: str = RETRIEVAL_DESCRIPTORS_FILE,
+     models: dict[str, torch.nn.Module] | None = None,
+ ):
+-    """Instantiate ``SaladRetrievalPipeline`` and run it on one collection."""
+-    pipeline = SaladRetrievalPipeline(
++    """Instantiate ``MegaLocRetrievalPipeline`` and run it on one collection."""
++    pipeline = MegaLocRetrievalPipeline(
+         args, world_size, rank, file_name, models=models
+     )
+     return pipeline.run()
+@@ -236,11 +255,11 @@ def run_preprocessing_pipeline_multi(
+     world_size: int,
+     rank: int,
+     datasets: list[str],
+-    file_name: str = "salad_descriptors.pt",
++    file_name: str = RETRIEVAL_DESCRIPTORS_FILE,
+     models: dict[str, torch.nn.Module] | None = None,
+ ):
+-    """Instantiate ``SaladRetrievalPipeline`` and run across sub-datasets."""
+-    pipeline = SaladRetrievalPipeline(
++    """Instantiate ``MegaLocRetrievalPipeline`` and run across sub-datasets."""
++    pipeline = MegaLocRetrievalPipeline(
+         args, world_size, rank, file_name, models=models
+     )
+     return pipeline.run_multi(datasets)
+diff --git a/gluemap/controllers/star_inference.py b/gluemap/controllers/star_inference.py
+index 9485675..843fe77 100644
+--- a/gluemap/controllers/star_inference.py
++++ b/gluemap/controllers/star_inference.py
+@@ -11,6 +11,10 @@ from gluemap.datasets.star import BaseStarDataset
+ from gluemap.estimators.covisibility_extraction import CovisibilityExtraction
+ from gluemap.estimators.track_inference import TrackInference
+ from gluemap.ff_inference.local_inference import create_local_inference
++from gluemap.ff_inference.moge3_depth import (
++    MoGe3DepthLocalInference,
++    MoGe3WorkerClient,
++)
+ from gluemap.utils.model_loader import load_models
+ 
+ logger = logging.getLogger(__name__)
+@@ -31,6 +35,8 @@ class BatchInferenceStar:
+         model_track: torch.nn.Module | None = None,
+         device: str = "cuda",
+         dtype: torch.dtype = torch.bfloat16,
++        *,
++        model_depth: MoGe3WorkerClient,
+     ):
+         self.model = model
+         self.model_type = model_type
+@@ -38,8 +44,8 @@ class BatchInferenceStar:
+         self.device = device
+         self.dtype = dtype
+ 
+-        self.local_inference = create_local_inference(
+-            model, model_type, device, dtype
++        self.local_inference = MoGe3DepthLocalInference(
++            create_local_inference(model, model_type, device, dtype), model_depth
+         )
+         self.track_inference = TrackInference(model_track, device)
+         self.covisibility_extraction = CovisibilityExtraction()
+@@ -172,24 +178,28 @@ class StarInferencePipeline(BaseInferencePipeline):
+ 
+     def _load_models(self) -> dict[str, torch.nn.Module]:
+         chosen_model = getattr(self.args, "chosen_model", "pi3")
++        required = {chosen_model, "moge3"}
+         if self.models is not None:
+             return self.models
+         if (
+             self.preloaded_models is not None
+-            and chosen_model in self.preloaded_models
++            and required <= self.preloaded_models.keys()
+         ):
+             self.models = self.preloaded_models
+             return self.models
+-        model_keys = (
+-            {chosen_model}
+-            if getattr(self.args, "use_dummy_tracks", False)
+-            else {chosen_model, "vggsfm"}
+-        )
++        model_keys = required.copy()
++        if not getattr(self.args, "use_dummy_tracks", False):
++            model_keys.add("vggsfm")
+         models, self.device = load_models(self.args, keys=model_keys)
+         self.models = models
+         self._owns_models = True
+         return self.models
+ 
++    def _release_models(self) -> None:
++        if self._owns_models and self.models is not None and "moge3" in self.models:
++            self.models["moge3"].close()
++        super()._release_models()
++
+     def _create_batch_inference(
+         self, models: dict[str, torch.nn.Module]
+     ) -> BatchInferenceStar:
+@@ -200,6 +210,7 @@ class StarInferencePipeline(BaseInferencePipeline):
+             models.get("vggsfm"),
+             device=self.device,
+             dtype=self.dtype,
++            model_depth=models["moge3"],
+         )
+ 
+     def _run_batch_step(
+diff --git a/gluemap/datasets/multi_sequence_twoview.py b/gluemap/datasets/multi_sequence_twoview.py
+index 1c0be07..39de308 100644
+--- a/gluemap/datasets/multi_sequence_twoview.py
++++ b/gluemap/datasets/multi_sequence_twoview.py
+@@ -8,6 +8,7 @@ import torch
+ 
+ from gluemap.datasets.base import DemoBaseDataset
+ from gluemap.datasets.utils import (
++    RETRIEVAL_DESCRIPTORS_FILE,
+     establish_neighbors_sequential,
+     get_image_list,
+     retrieve_global_neighbors,
+@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
+ class MultiSequencePairs(DemoBaseDataset):
+     """Two-view dataset spanning several sequence subfolders.
+ 
+-    Each sequence has its own SALAD descriptors and sequential
++    Each sequence has its own MegaLoc descriptors and sequential
+     neighborhood; pairs are then merged across sequences via a global
+     FAISS retrieval over the concatenated descriptor bank.
+     """
+@@ -40,7 +41,7 @@ class MultiSequencePairs(DemoBaseDataset):
+ 
+         super().__init__(args, patch_size=16)
+ 
+-        # Load all the images, and generate SALAD descriptors for matching
++        # Load all the images, and generate MegaLoc descriptors for matching
+         img_list = []
+         for dataset in self.datasets:
+             img_list.extend(
+@@ -102,7 +103,7 @@ class MultiSequencePairs(DemoBaseDataset):
+     ) -> None:
+         """Populate ``self.pairs`` with intra- and inter-sequence pairs.
+ 
+-        Per sequence: load SALAD descriptors and build the local
++        Per sequence: load MegaLoc descriptors and build the local
+         sequential window (offsetting indices into the combined image
+         index space). Across sequences: feed the per-sequence neighbor
+         tensors and descriptor banks into
+@@ -127,7 +128,7 @@ class MultiSequencePairs(DemoBaseDataset):
+         for dataset in datasets:
+             logger.info(f"Constructing pairs for dataset: {dataset}")
+ 
+-            # For each subfolder, load SALAD descriptors and construct
++            # For each subfolder, load MegaLoc descriptors and construct
+             # sequential pairs
+             img_list_dataset = [
+                 x
+@@ -190,11 +191,11 @@ class MultiSequencePairs(DemoBaseDataset):
+             ``(neighbors, descriptors_db)``. ``neighbors`` is the
+             ``(N, K + 1)`` long tensor from
+             :func:`establish_neighbors_sequential`. ``descriptors_db``
+-            is the cached SALAD descriptor tensor or ``None`` when the
++            is the cached MegaLoc descriptor tensor or ``None`` when the
+             file is absent.
+         """
+         descriptors_path = os.path.join(
+-            args.curr_processed, dataset, "salad_descriptors.pt"
++            args.curr_processed, dataset, RETRIEVAL_DESCRIPTORS_FILE
+         )
+ 
+         # TODO: add subsampling logic here if necessary
+@@ -202,7 +203,7 @@ class MultiSequencePairs(DemoBaseDataset):
+             descriptors_db = torch.load(descriptors_path, weights_only=False)
+         else:
+             raise FileNotFoundError(
+-                f"SALAD descriptors not found at {descriptors_path}. "
++                f"MegaLoc descriptors not found at {descriptors_path}. "
+                 "Run multi-sequence preprocessing first, or set "
+                 "rerun_from: retrieval to regenerate descriptor caches."
+             )
+diff --git a/gluemap/datasets/sequential_twoview.py b/gluemap/datasets/sequential_twoview.py
+index bd6b5c0..c0addbf 100644
+--- a/gluemap/datasets/sequential_twoview.py
++++ b/gluemap/datasets/sequential_twoview.py
+@@ -5,6 +5,7 @@ import torch
+ 
+ from gluemap.datasets.twoview import BaseTwoViewDataset
+ from gluemap.datasets.utils import (
++    RETRIEVAL_DESCRIPTORS_FILE,
+     establish_neighbors_sequential,
+     retrieve_global_neighbors,
+ )
+@@ -46,7 +47,7 @@ class SequentialTwoViewDataset(BaseTwoViewDataset):
+     ) -> None:
+         """Populate ``self.pairs`` and ``self.sequential_edges``.
+ 
+-        Loads cached SALAD descriptors (required — no fallback), builds
++        Loads cached MegaLoc descriptors (required — no fallback), builds
+         a sequential window via :func:`establish_neighbors_sequential`,
+         merges with FAISS global retrieval via
+         :func:`retrieve_global_neighbors`, and records the immediate
+@@ -61,10 +62,10 @@ class SequentialTwoViewDataset(BaseTwoViewDataset):
+                 sequential descriptor lookup keys off ``self.images_list``.
+ 
+         Raises:
+-            FileNotFoundError: If ``salad_descriptors.pt`` is missing.
++            FileNotFoundError: If ``megaloc_descriptors.pt`` is missing.
+         """
+         descriptors_path = os.path.join(
+-            args.curr_processed, "salad_descriptors.pt"
++            args.curr_processed, RETRIEVAL_DESCRIPTORS_FILE
+         )
+ 
+         if os.path.exists(descriptors_path):
+@@ -78,15 +79,15 @@ class SequentialTwoViewDataset(BaseTwoViewDataset):
+ 
+         else:
+             raise FileNotFoundError(
+-                f"SALAD descriptors not found at {descriptors_path}. "
+-                "Please run SALAD descriptor extraction first."
++                f"MegaLoc descriptors not found at {descriptors_path}. "
++                "Please run MegaLoc descriptor extraction first."
+             )
+ 
+         neighbors = establish_neighbors_sequential(
+             self.images_list, num_neighbors=args.num_neighbors_sequential
+         )  # N, num_neighbors + 1
+ 
+-        # retrieve global neighbors based on SALAD descriptors
++        # retrieve global neighbors based on MegaLoc descriptors
+         self.pairs = retrieve_global_neighbors(
+             args, [neighbors], [descriptors_db]
+         )
+diff --git a/gluemap/datasets/twoview.py b/gluemap/datasets/twoview.py
+index d7727d3..f1d6d01 100644
+--- a/gluemap/datasets/twoview.py
++++ b/gluemap/datasets/twoview.py
+@@ -8,7 +8,7 @@ import numpy as np
+ import torch
+ 
+ from gluemap.datasets.base import DemoBaseDataset
+-from gluemap.datasets.utils import get_image_list
++from gluemap.datasets.utils import RETRIEVAL_DESCRIPTORS_FILE, get_image_list
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -17,7 +17,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+     """Two-view dataset that yields image pairs for pairwise inference.
+ 
+     Discovers images under ``args.images_path``, optionally filters to a
+-    user-supplied list, builds candidate pairs from cached SALAD
++    user-supplied list, builds candidate pairs from cached MegaLoc
+     descriptors (or falls back to exhaustive matching), and exposes the
+     pairs as PyTorch-style ``(images, ...)`` items.
+     """
+@@ -32,7 +32,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+         """
+         super().__init__(args, patch_size=16)
+ 
+-        # Load all the images, and generate SALAD descriptors for matching
++        # Load all the images, and generate MegaLoc descriptors for matching
+         img_list_full, img_list_used = self._get_image_list(args)
+ 
+         # Now, use all the images in the folder
+@@ -48,7 +48,7 @@ class BaseTwoViewDataset(DemoBaseDataset):
+             args.images_path for _ in range(len(self.images_list))
+         ]
+ 
+-        # if salad descriptors are available, use them to construct pairs,
++        # if MegaLoc descriptors are available, use them to construct pairs,
+         # else, use exhaustive matching
+         self._construct_pairs(args, img_list_full)
+ 
+@@ -136,8 +136,8 @@ class BaseTwoViewDataset(DemoBaseDataset):
+     ) -> None:
+         """Populate ``self.pairs`` with undirected unique pair indices.
+ 
+-        Uses a FAISS L2 search over cached SALAD descriptors at
+-        ``args.curr_processed/salad_descriptors.pt`` when available and
++        Uses a FAISS L2 search over cached MegaLoc descriptors at
++        ``args.curr_processed/megaloc_descriptors.pt`` when available and
+         the descriptor count is large enough. Otherwise falls back to
+         exhaustive matching.
+ 
+@@ -148,10 +148,10 @@ class BaseTwoViewDataset(DemoBaseDataset):
+                 preprocessing — used to map current ``self.images_list``
+                 entries back to descriptor rows.
+         """
+-        # TODO: extract the SALAD descriptors on the fly
++        # TODO: extract the MegaLoc descriptors on the fly
+ 
+         descriptors_path = os.path.join(
+-            args.curr_processed, "salad_descriptors.pt"
++            args.curr_processed, RETRIEVAL_DESCRIPTORS_FILE
+         )
+         # args.num_neighbors = 100
+ 
+diff --git a/gluemap/datasets/utils.py b/gluemap/datasets/utils.py
+index 7bf66be..e9e5e4d 100644
+--- a/gluemap/datasets/utils.py
++++ b/gluemap/datasets/utils.py
+@@ -9,6 +9,8 @@ import torch
+ 
+ logger = logging.getLogger(__name__)
+ 
++RETRIEVAL_DESCRIPTORS_FILE = "megaloc_descriptors.pt"
++
+ 
+ def get_image_list(images_path: str) -> list[str]:
+     """List image files under ``images_path`` recursively, sorted by path.
+diff --git a/gluemap/estimators/augmented_bundle_adjustment.py b/gluemap/estimators/augmented_bundle_adjustment.py
+index 4980380..d530e5a 100644
+--- a/gluemap/estimators/augmented_bundle_adjustment.py
++++ b/gluemap/estimators/augmented_bundle_adjustment.py
+@@ -210,6 +210,7 @@ def bundle_adjustment(
+     max_num_iterations: int = 200,
+     loss_type_normal: str = "huber",
+     loss_type_virtual: str = "arctan",
++    refine_intrinsics: bool = True,
+ ) -> tuple[
+     pycolmap.Reconstruction,
+     pycolmap.Reconstruction | None,
+@@ -238,6 +239,8 @@ def bundle_adjustment(
+             ``"trivial"``, ``"huber"``, ``"cauchy"``.
+         loss_type_virtual: Loss function for virtual tracks. One of
+             ``"trivial"``, ``"huber"``, ``"arctan"``, ``"cauchy"``.
++        refine_intrinsics: If False, hold every camera's intrinsics constant
++            for both real and virtual residuals.
+ 
+     Returns:
+         (reconstruction, virtual_reconstruction, summary) with parameters
+@@ -260,12 +263,19 @@ def bundle_adjustment(
+     ba_options.ceres.solver_options.max_num_iterations = max_num_iterations
+     ba_options.ceres.auto_select_solver_type = True
+     ba_options.ceres.loss_function_type = _pycolmap_loss_type(loss_type_normal)
++    if not refine_intrinsics:
++        ba_options.refine_focal_length = False
++        ba_options.refine_principal_point = False
++        ba_options.refine_extra_params = False
+ 
+     ba_config = pycolmap.BundleAdjustmentConfig()
+     for image_id in reconstruction.images:
+         ba_config.add_image(image_id)
+     for point3D_id in reconstruction.points3D:
+         ba_config.add_variable_point(point3D_id)
++    if not refine_intrinsics:
++        for camera_id in reconstruction.cameras:
++            ba_config.set_constant_cam_intrinsics(camera_id)
+     ba_config.fix_gauge(pycolmap.BundleAdjustmentGauge.TWO_CAMS_FROM_WORLD)
+ 
+     bundle_adjuster = pycolmap.create_default_ceres_bundle_adjuster(
+@@ -288,6 +298,15 @@ def bundle_adjustment(
+         negative_depth_observations=negative_depth_observations,
+         loss_function=_pyceres_loss_function(loss_type_virtual),
+     )
++    if not refine_intrinsics:
++        for camera in reconstruction.cameras.values():
++            params = camera.params
++            if (
++                problem.has_parameter_block(params)
++                and not problem.is_parameter_block_constant(params)
++            ):
++                problem.set_parameter_block_constant(params)
++        logger.info(f"Intrinsics fixed for {len(reconstruction.cameras)} camera(s)")
+ 
+     logger.info(
+         f"After virtual residual add: "
+diff --git a/gluemap/eval/ablations_pure_feedforward.py b/gluemap/eval/ablations_pure_feedforward.py
+index 2cb8445..08f81ed 100644
+--- a/gluemap/eval/ablations_pure_feedforward.py
++++ b/gluemap/eval/ablations_pure_feedforward.py
+@@ -87,7 +87,7 @@ def run_direct_inference_pipeline(
+     """
+     Direct backbone inference: load all images, run backbone, write COLMAP.
+ 
+-    Skips SALAD retrieval, two-view inference, star construction, global
++    Skips MegaLoc retrieval, two-view inference, star construction, global
+     mapping, and refinement. Feeds all images to the backbone in a single
+     forward pass.
+ 
+diff --git a/gluemap/ff_inference/moge3_depth.py b/gluemap/ff_inference/moge3_depth.py
+new file mode 100644
+index 0000000..6d7df45
+--- /dev/null
++++ b/gluemap/ff_inference/moge3_depth.py
+@@ -0,0 +1,424 @@
++"""MoGe-3 ViT-L depth replacement for star inference.
++
++The backbone (Pi3/Pi3X, VGGT, MapAnything) still predicts poses and intrinsics;
++only its depth maps are replaced. MoGe-3 needs a newer torch stack than GlueMap,
++so it runs in a subprocess worker (:mod:`gluemap.ff_inference.moge3_worker`)
++driven over a length-prefixed binary pipe, following the ``amb3r_inference.py``
++pattern. Per image, MoGe depth is scale-aligned to the backbone depth via a
++robust log-median ratio over the backbone's most confident pixels.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import math
++import os
++import struct
++import subprocess
++import tempfile
++from collections.abc import Sequence
++from pathlib import Path
++from typing import NoReturn
++
++import numpy as np
++import torch
++
++from gluemap.ff_inference.local_inference import LocalInference
++
++logger = logging.getLogger(__name__)
++
++MOGE3_SOURCE = Path(__file__).resolve().parents[2] / "thirdparty" / "moge"
++MOGE3_RESOLUTION_LEVEL = 9
++MOGE3_REFINE_STEPS = 3
++MIN_ALIGNMENT_PIXELS = 100
++ALIGNMENT_CONF_QUANTILE = 0.5
++
++_STDERR_TAIL_BYTES = 4000
++
++
++class MoGe3WorkerClient:
++    """Drive ``moge3_worker.py`` in the MoGe-3 environment over a binary pipe.
++
++    MoGe-3 needs torch/flex_gemm unavailable in the GlueMap env, so it lives in
++    a separate process. One request sends ``(n,3,h,w)`` float32 images in
++    [0, 1] with per-image keys and horizontal FOVs; the worker forwards each
++    unique ``(key, shape)`` through the backbone at most once (caching the
++    point map) and re-solves only the affine shift per FOV.
++    """
++
++    def __init__(self, python: str, checkpoint: str) -> None:
++        self.num_requests = 0
++        self.num_images = 0
++        self.num_forwarded = 0
++        self.process: subprocess.Popen | None = None
++        self._stderr = None
++        self._ready = False
++        self._close_logged = False
++        if not python or not Path(python).expanduser().exists():
++            raise ValueError(f"MoGe-3 worker python does not exist: {python!r}")
++        if not (MOGE3_SOURCE / "moge" / "model" / "v3.py").exists():
++            raise ImportError(
++                "thirdparty/moge is not initialized; "
++                "run git submodule update --init --recursive"
++            )
++        if not checkpoint:
++            raise ValueError(
++                "MoGe-3 requires a checkpoint: local model.pt or HF repo id"
++            )
++        ckpt_path = Path(checkpoint).expanduser()
++        ckpt = str(ckpt_path.resolve()) if ckpt_path.exists() else checkpoint
++        worker = Path(__file__).with_name("moge3_worker.py").resolve()
++        try:
++            self._stderr = tempfile.TemporaryFile()
++            self.process = subprocess.Popen(
++                [
++                    str(Path(python).expanduser()),
++                    str(worker),
++                    "--source",
++                    str(MOGE3_SOURCE),
++                    "--checkpoint",
++                    ckpt,
++                    "--resolution-level",
++                    str(MOGE3_RESOLUTION_LEVEL),
++                    "--refine-steps",
++                    str(MOGE3_REFINE_STEPS),
++                ],
++                stdin=subprocess.PIPE,
++                stdout=subprocess.PIPE,
++                stderr=self._stderr,
++            )
++            header, _ = self._receive_header()
++            if not header.get("ready"):
++                self._fail("MoGe-3 worker did not signal readiness")
++            self._ready = True
++        except Exception:
++            self.close()
++            raise
++        logger.info(
++            f"MoGe-3 worker ready: {header.get('moge_file')} "
++            f"(num_tokens={header.get('num_tokens')})"
++        )
++
++    def _stderr_tail(self) -> str:
++        stderr = getattr(self, "_stderr", None)
++        if stderr is None:
++            return "<no worker stderr>"
++        stderr.flush()
++        stderr.seek(0, os.SEEK_END)
++        size = stderr.tell()
++        stderr.seek(max(0, size - _STDERR_TAIL_BYTES))
++        return stderr.read().decode("utf-8", errors="replace")
++
++    def _fail(self, message: str) -> NoReturn:
++        raise RuntimeError(
++            f"{message}\n--- worker stderr (tail) ---\n{self._stderr_tail()}"
++        )
++
++    def _read_exact(self, size: int) -> bytes:
++        chunks = []
++        remaining = size
++        while remaining:
++            chunk = self.process.stdout.read(remaining)
++            if not chunk:
++                self._fail("MoGe-3 worker closed its output unexpectedly")
++            chunks.append(chunk)
++            remaining -= len(chunk)
++        return b"".join(chunks)
++
++    def _receive_header(self) -> tuple[dict, int]:
++        (length,) = struct.unpack("<Q", self._read_exact(8))
++        header = json.loads(self._read_exact(length).decode("utf-8"))
++        if "error" in header:
++            self._fail(f"MoGe-3 worker error: {header['error']}")
++        return header, length
++
++    def infer_depth(
++        self, keys: list[str], images: np.ndarray, fov_x: np.ndarray
++    ) -> tuple[np.ndarray, np.ndarray]:
++        """Run MoGe-3 on float32 ``(n,3,h,w)`` images in [0, 1].
++
++        Args:
++            keys: Per-image cache keys (stable across stars for the same file).
++            images: Contiguous-able ``(n,3,h,w)`` float array in [0, 1].
++            fov_x: Per-image horizontal field of view in degrees.
++
++        Returns:
++            ``(depth, valid)`` with ``depth`` float32 ``(n,h,w)`` and ``valid``
++            bool ``(n,h,w)``.
++        """
++        images = np.ascontiguousarray(images, dtype="<f4")
++        if images.ndim != 4 or images.shape[1] != 3:
++            raise ValueError(
++                "MoGe-3 infer_depth needs (n,3,h,w) images, "
++                f"got shape {images.shape}"
++            )
++        n, _, h, w = (int(v) for v in images.shape)
++        if n == 0:
++            raise ValueError("MoGe-3 infer_depth needs at least one image")
++        keys = [str(k) for k in keys]
++        fov = [float(v) for v in np.asarray(fov_x).reshape(-1).tolist()]
++        if len(keys) != n or len(fov) != n:
++            raise ValueError(
++                f"keys ({len(keys)}) / fov_x ({len(fov)}) disagree with n={n}"
++            )
++        header = json.dumps(
++            {"keys": keys, "fov_x": fov, "shape": [n, 3, h, w]}
++        ).encode("utf-8")
++        try:
++            self.process.stdin.write(struct.pack("<Q", len(header)))
++            self.process.stdin.write(header)
++            self.process.stdin.write(images.tobytes())
++            self.process.stdin.flush()
++        except (BrokenPipeError, OSError):
++            self._fail("MoGe-3 worker pipe is broken")
++        response, _ = self._receive_header()
++        arrays = {}
++        for name, shape in response["arrays"].items():
++            shape = [int(v) for v in shape]
++            count = int(np.prod(shape))
++            if count < 0:
++                self._fail(f"MoGe-3 worker sent invalid shape for {name!r}")
++            data = self._read_exact(count * 4)
++            arrays[name] = np.frombuffer(data, dtype="<f4").reshape(shape).copy()
++        if "depth" not in arrays or "mask" not in arrays:
++            self._fail("MoGe-3 worker response is missing depth/mask arrays")
++        depth = arrays["depth"]
++        mask = arrays["mask"]
++        if list(depth.shape) != [n, h, w] or list(mask.shape) != [n, h, w]:
++            self._fail(
++                f"MoGe-3 worker shape mismatch: depth {list(depth.shape)}, "
++                f"mask {list(mask.shape)}, expected [{n}, {h}, {w}]"
++            )
++        self.num_requests += 1
++        self.num_images += n
++        self.num_forwarded += int(response.get("forwarded", 0))
++        return depth.astype(np.float32, copy=False), mask > 0.5
++
++    def close(self) -> None:
++        process = getattr(self, "process", None)
++        self.process = None
++        try:
++            if process is not None:
++                try:
++                    if process.stdin:
++                        process.stdin.close()
++                except (BrokenPipeError, OSError):
++                    pass
++                try:
++                    process.wait(timeout=30)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++                    process.wait()
++                if process.stdout:
++                    process.stdout.close()
++        finally:
++            stderr = getattr(self, "_stderr", None)
++            self._stderr = None
++            if stderr is not None:
++                try:
++                    stderr.close()
++                except OSError:
++                    pass
++            if (
++                process is not None
++                and getattr(self, "_ready", False)
++                and not getattr(self, "_close_logged", False)
++            ):
++                self._close_logged = True
++                logger.info(
++                    f"MoGe-3 worker: {self.num_forwarded} forward passes for "
++                    f"{self.num_images} depth maps in {self.num_requests} "
++                    "requests"
++                )
++
++    def __del__(self) -> None:
++        try:
++            self.close()
++        except Exception:
++            pass
++
++
++def content_box(
++    images_change: Sequence[float],
++    shape_ori: Sequence[int],
++    canvas_hw: tuple[int, int],
++) -> tuple[int, int, int, int]:
++    """Recover the content box of one image inside the padded canvas.
++
++    Args:
++        images_change: ``[scale_x, scale_y, x_offset, y_offset]`` mapping the
++            original image into the canvas.
++        shape_ori: Original ``[H, W]`` of the image.
++        canvas_hw: Canvas ``(H, W)``.
++
++    Returns:
++        ``(x0, y0, w, h)`` in canvas pixels.
++    """
++    sx, sy, ox, oy = (float(v) for v in images_change)
++    h_ori, w_ori = (int(v) for v in shape_ori)
++    h_canvas, w_canvas = (int(v) for v in canvas_hw)
++    x0, y0 = round(ox), round(oy)
++    w, h = round(w_ori * sx), round(h_ori * sy)
++    if w <= 0 or h <= 0:
++        raise ValueError(f"empty MoGe-3 content box: w={w}, h={h}")
++    if x0 < 0 or y0 < 0 or x0 + w > w_canvas or y0 + h > h_canvas:
++        raise ValueError(
++            f"MoGe-3 content box {(x0, y0, w, h)} extends past canvas "
++            f"(H={h_canvas}, W={w_canvas})"
++        )
++    return x0, y0, w, h
++
++
++def align_moge_depth(
++    backbone_depth: torch.Tensor,
++    backbone_conf: torch.Tensor,
++    moge_depth: torch.Tensor,
++    moge_valid: torch.Tensor,
++    min_valid_pixels: int = MIN_ALIGNMENT_PIXELS,
++    conf_quantile: float = ALIGNMENT_CONF_QUANTILE,
++) -> float | None:
++    """Solve the scale aligning MoGe depth to backbone depth.
++
++    All inputs are ``(h, w)``. The scale is ``exp(median(log(bb) - log(mo)))``
++    over pixels that are valid in both maps and in the top-``conf_quantile``
++    tail of backbone confidence, so it is robust to sky, outliers and the
++    backbone's confidence scale (Pi3 logits and VGGT/MapAnything scores alike;
++    uniform confidence keeps every eligible pixel).
++
++    Returns:
++        The scale, or ``None`` when fewer than ``min_valid_pixels`` pixels
++        support the fit.
++    """
++    backbone_depth = torch.as_tensor(backbone_depth)
++    backbone_conf = torch.as_tensor(backbone_conf)
++    moge_depth = torch.as_tensor(moge_depth)
++    moge_valid = torch.as_tensor(moge_valid, dtype=torch.bool)
++    eligible = (
++        moge_valid
++        & torch.isfinite(moge_depth)
++        & (moge_depth > 0)
++        & torch.isfinite(backbone_depth)
++        & (backbone_depth > 0)
++        & torch.isfinite(backbone_conf)
++    )
++    if int(eligible.sum()) < min_valid_pixels:
++        return None
++    cutoff = torch.quantile(backbone_conf[eligible].float(), conf_quantile)
++    support = eligible & (backbone_conf >= cutoff)
++    if int(support.sum()) < min_valid_pixels:
++        return None
++    log_ratio = torch.log(backbone_depth[support].float()) - torch.log(
++        moge_depth[support].float()
++    )
++    return float(torch.exp(torch.median(log_ratio)))
++
++
++class MoGe3DepthLocalInference(LocalInference):
++    """Replace backbone depth with scale-aligned MoGe-3 depth.
++
++    Poses, intrinsics and confidences pass through untouched. MoGe runs on the
++    backbone's exact canvas pixels cropped to each image's content box, so its
++    output aligns 1:1 with the backbone grid without resampling. Padding and
++    MoGe-invalid pixels keep backbone depth.
++    """
++
++    def __init__(
++        self, backbone: LocalInference, client: MoGe3WorkerClient
++    ) -> None:
++        super().__init__(backbone.model, backbone.device, backbone.dtype)
++        self.backbone = backbone
++        self.client = client
++
++    @torch.no_grad()
++    def predict(self, batch: dict) -> dict:
++        pred = self.backbone.predict(batch)
++        depth = pred["depth"]
++        images = batch["images"]
++        if (
++            depth.ndim != 5
++            or depth.shape[-1] != 1
++            or tuple(depth.shape[2:4]) != tuple(images.shape[-2:])
++        ):
++            raise ValueError(
++                "MoGe-3 depth replacement needs backbone depth at the input "
++                f"canvas resolution (B,N,H,W,1); got depth {tuple(depth.shape)}"
++                f" for images {tuple(images.shape)}"
++            )
++        b_count, n_count = images.shape[0], images.shape[1]
++        height, width = images.shape[-2], images.shape[-1]
++        out = depth[..., 0].float().clone()
++        conf = pred["depth_conf"]
++        if conf.ndim == 5 and conf.shape[-1] == 1:
++            conf = conf[..., 0]
++        images_change = batch["images_change"]
++        images_shape_ori = batch["images_shape_ori"]
++        image_paths = batch["image_paths"]
++        intrinsics = pred["intrinsics"]
++        groups: dict[tuple[int, int], list[tuple[int, int, int, int, str, float]]] = {}
++        for b in range(b_count):
++            for n in range(n_count):
++                change = images_change[b][n]
++                change = (
++                    change.tolist() if hasattr(change, "tolist") else list(change)
++                )
++                shape_ori = images_shape_ori[b][n]
++                shape_ori = (
++                    shape_ori.tolist()
++                    if hasattr(shape_ori, "tolist")
++                    else list(shape_ori)
++                )
++                x0, y0, w, h = content_box(
++                    change, shape_ori, (height, width)
++                )
++                key = str(image_paths[n][b])
++                fx = float(intrinsics[b][n][0][0])
++                if not math.isfinite(fx) or fx <= 0:
++                    logger.warning(
++                        f"MoGe-3 depth not aligned for {key}: invalid backbone"
++                        f" focal {fx}; keeping backbone depth"
++                    )
++                    continue
++                fov_x = math.degrees(2.0 * math.atan(w / (2.0 * fx)))
++                groups.setdefault((h, w), []).append((b, n, x0, y0, key, fov_x))
++        can_cuda = torch.cuda.is_available()
++        for (h, w), members in groups.items():
++            crops = np.stack(
++                [
++                    images[b, n, :, y0 : y0 + h, x0 : x0 + w]
++                    .float()
++                    .cpu()
++                    .numpy()
++                    for b, n, x0, y0, _, _ in members
++                ]
++            )
++            keys = [key for _, _, _, _, key, _ in members]
++            fovs = np.array(
++                [fov for _, _, _, _, _, fov in members], dtype=np.float64
++            )
++            if can_cuda:
++                torch.cuda.empty_cache()
++            moge_depths, moge_masks = self.client.infer_depth(keys, crops, fovs)
++            for (b, n, x0, y0, key, _), moge, valid in zip(
++                members, moge_depths, moge_masks
++            ):
++                out_box = out[b, n, y0 : y0 + h, x0 : x0 + w]
++                conf_box = conf[b, n, y0 : y0 + h, x0 : x0 + w]
++                moge_t = torch.from_numpy(np.ascontiguousarray(moge)).to(
++                    device=out.device, dtype=torch.float32
++                )
++                valid_t = torch.from_numpy(np.ascontiguousarray(valid)).to(
++                    out.device
++                )
++                scale = align_moge_depth(out_box, conf_box, moge_t, valid_t)
++                if scale is None:
++                    logger.warning(
++                        f"MoGe-3 depth not aligned for {key}; "
++                        "keeping backbone depth"
++                    )
++                    continue
++                out[b, n, y0 : y0 + h, x0 : x0 + w] = torch.where(
++                    valid_t, moge_t * scale, out_box
++                )
++        pred["depth"] = out.unsqueeze(-1)
++        return pred
+diff --git a/gluemap/ff_inference/moge3_worker.py b/gluemap/ff_inference/moge3_worker.py
+new file mode 100644
+index 0000000..e6d993f
+--- /dev/null
++++ b/gluemap/ff_inference/moge3_worker.py
+@@ -0,0 +1,209 @@
++"""Standalone MoGe-3 depth worker (runs in the MoGe-3 conda environment).
++
++This script must not import ``gluemap``: the MoGe-3 environment has a different
++Python / torch stack than GlueMap. It speaks a length-prefixed binary protocol
++over stdin/stdout (little endian):
++
++    message = uint64 header_length | UTF-8 JSON header | raw float32 C-order bytes
++
++Startup sends ``{"ready": true, "moge_file": ..., "num_tokens": ...}``. A request
++header is ``{"keys": [str]*n, "fov_x": [float]*n, "shape": [n,3,h,w]}`` followed
++by float32 images in [0, 1]. The response header is
++``{"arrays": {"depth": [n,h,w], "mask": [n,h,w]}, "forwarded": m}`` followed by
++the depth array and the mask array (1.0 / 0.0) concatenated in header order, or
++``{"error": "..."}`` followed by exit code 1. EOF on stdin exits 0.
++
++Each image is forwarded through the ViT-L backbone plus sparse 3D refiner at
++most once per (key, shape); the resulting point map is cached on CPU in fp16
++and the per-request horizontal FOV only re-solves the affine depth shift, which
++is exactly ``MoGeModel.infer(fov_x=...)`` up to the per-image metric scale.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import struct
++import sys
++import traceback
++from collections import OrderedDict
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++
++FORWARD_CHUNK = 2
++MAX_CACHED_IMAGES = 4096
++
++
++def _read_exact(stream, size: int) -> bytes:
++    chunks = []
++    remaining = size
++    while remaining:
++        chunk = stream.read(remaining)
++        if not chunk:
++            if remaining == size and not chunks:
++                return b""
++            raise EOFError("truncated message")
++        chunks.append(chunk)
++        remaining -= len(chunk)
++    return b"".join(chunks)
++
++
++def _send(out, header: dict, payload: bytes = b"") -> None:
++    blob = json.dumps(header).encode("utf-8")
++    out.write(struct.pack("<Q", len(blob)))
++    out.write(blob)
++    out.write(payload)
++    out.flush()
++
++
++def compute_points(
++    model: Any, images: torch.Tensor, num_tokens: int, refine_steps: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Run the MoGe-3 forward pass on fp32 CUDA ``(n,3,h,w)`` images.
++
++    Returns ``(points, mask)`` with ``points`` fp32 ``(n,h,w,3)`` and ``mask``
++    bool ``(n,h,w)``, matching ``MoGeModel.infer`` with ``use_fp16=False``.
++    """
++    with torch.inference_mode():
++        out = model.forward(images, num_tokens=num_tokens, refine_steps=refine_steps)
++    return out["points"].float(), out["mask"] > 0.5
++
++
++def depth_for_fov(
++    points: torch.Tensor, mask: torch.Tensor, fov_x_deg: Any
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Convert cached affine points to depth for the given per-image FOVs.
++
++    ``points`` is fp32 CPU ``(n,h,w,3)``, ``mask`` is bool ``(n,h,w)`` and
++    ``fov_x_deg`` broadcasts to ``(n,)``. This reproduces
++    ``MoGeModel.infer(fov_x=...)`` (v3.py focal formula plus ``z + shift``)
++    without the metric scale, which the caller absorbs by depth alignment.
++    """
++    from moge.utils.geometry_torch import recover_focal_shift
++
++    fov = torch.as_tensor(fov_x_deg, dtype=torch.float32).reshape(-1)
++    h, w = points.shape[1], points.shape[2]
++    a = w / h
++    focal = a / (1 + a**2) ** 0.5 / torch.tan(torch.deg2rad(fov) / 2)
++    _, shift = recover_focal_shift(points, mask, focal=focal)
++    depth = points[..., 2] + shift[:, None, None]
++    return depth, mask & (depth > 0)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--source", required=True)
++    parser.add_argument("--checkpoint", required=True)
++    parser.add_argument("--resolution-level", type=int, required=True)
++    parser.add_argument("--refine-steps", type=int, required=True)
++    args = parser.parse_args()
++
++    if not os.path.isdir(args.source):
++        print(f"MoGe source directory not found: {args.source}", file=sys.stderr)
++        sys.exit(1)
++
++    # Keep the protocol channel clean: everything printed by libraries goes to stderr.
++    out = os.fdopen(os.dup(1), "wb")
++    os.dup2(2, 1)
++    stdin = sys.stdin.buffer
++
++    sys.path.insert(0, args.source)
++    import moge
++    from moge.model.v3 import MoGeModel
++
++    moge_file = Path(moge.__file__).resolve()
++    if moge_file != Path(args.source).resolve() and Path(args.source).resolve() not in moge_file.parents:
++        print(
++            f"MoGe imported from {moge_file}, not from --source {args.source}",
++            file=sys.stderr,
++        )
++        sys.exit(1)
++
++    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
++    model = MoGeModel.from_pretrained(args.checkpoint).cuda().eval()
++    lo, hi = model.num_tokens_range
++    num_tokens = int(lo + args.resolution_level / 9 * (hi - lo))
++    _send(out, {"ready": True, "moge_file": str(moge_file), "num_tokens": num_tokens})
++
++    cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
++
++    while True:
++        raw = _read_exact(stdin, 8)
++        if not raw:
++            sys.exit(0)
++        try:
++            (length,) = struct.unpack("<Q", raw)
++            header = json.loads(_read_exact(stdin, length).decode("utf-8"))
++            keys = [str(k) for k in header["keys"]]
++            fov_x = header["fov_x"]
++            shape = tuple(int(v) for v in header["shape"])
++            if len(shape) != 4 or shape[1] != 3:
++                raise ValueError(f"expected shape [n,3,h,w], got {list(shape)}")
++            n, _, h, w = shape
++            if len(keys) != n or len(fov_x) != n:
++                raise ValueError(
++                    f"keys ({len(keys)}) / fov_x ({len(fov_x)}) disagree with n={n}"
++                )
++            count = int(np.prod(shape))
++            data = _read_exact(stdin, count * 4)
++            images = np.frombuffer(data, dtype="<f4").reshape(shape)
++
++            for key in keys:
++                entry = cache.get(key)
++                if entry is not None and entry[0].shape[:2] == (h, w):
++                    cache.move_to_end(key)
++            missing: list[str] = []
++            for key in keys:
++                entry = cache.get(key)
++                if (entry is None or entry[0].shape[:2] != (h, w)) and key not in missing:
++                    missing.append(key)
++            index_of = {}
++            for i, key in enumerate(keys):
++                index_of.setdefault(key, i)
++            with torch.inference_mode():
++                for start in range(0, len(missing), FORWARD_CHUNK):
++                    chunk_keys = missing[start : start + FORWARD_CHUNK]
++                    chunk = torch.from_numpy(
++                        images[[index_of[k] for k in chunk_keys]]
++                    ).cuda()
++                    pts, msk = compute_points(
++                        model, chunk, num_tokens, args.refine_steps
++                    )
++                    for key, p, m in zip(chunk_keys, pts, msk):
++                        cache[key] = (p.half().cpu(), m.cpu())
++                        cache.move_to_end(key)
++                    del chunk, pts, msk
++            if missing:
++                torch.cuda.empty_cache()
++
++            stacked_points = torch.stack([cache[k][0] for k in keys]).float()
++            stacked_mask = torch.stack([cache[k][1] for k in keys])
++            depth, valid = depth_for_fov(stacked_points, stacked_mask, fov_x)
++            while len(cache) > MAX_CACHED_IMAGES:
++                cache.popitem(last=False)
++            arrays = {
++                "depth": np.ascontiguousarray(depth.numpy().astype("<f4", copy=False)),
++                "mask": np.ascontiguousarray(
++                    valid.float().numpy().astype("<f4", copy=False)
++                ),
++            }
++            _send(
++                out,
++                {
++                    "arrays": {k: list(v.shape) for k, v in arrays.items()},
++                    "forwarded": len(missing),
++                },
++                b"".join(v.tobytes() for v in arrays.values()),
++            )
++        except Exception:
++            tail = "".join(traceback.format_exc().splitlines(keepends=True)[-12:])
++            _send(out, {"error": tail})
++            sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/gluemap/math/reprojection_error.py b/gluemap/math/reprojection_error.py
+index 646941a..50d898a 100644
+--- a/gluemap/math/reprojection_error.py
++++ b/gluemap/math/reprojection_error.py
+@@ -18,6 +18,16 @@ class ReprojectionErrorType(Enum):
+     ANGULAR = "angular"
+ 
+ 
++def _camera_focal_xy(camera: pycolmap.Camera) -> tuple[float, float]:
++    indices = camera.focal_length_idxs()
++    if len(indices) == 1:
++        f = float(camera.params[indices[0]])
++        return f, f
++    if len(indices) >= 2:
++        return float(camera.params[indices[0]]), float(camera.params[indices[1]])
++    raise ValueError(f"Camera {camera.model} has no focal length parameters")
++
++
+ def compute_point_error(
+     world_point: np.ndarray,
+     R: np.ndarray,
+@@ -69,7 +79,10 @@ def compute_point_error(
+             + (projected[1] - observed[1]) ** 2
+         )
+         if error_type == ReprojectionErrorType.NORMALIZED:
+-            return pixel_error / camera.focal_length
++            fx, fy = _camera_focal_xy(camera)
++            if abs(fx) < 1e-12 or abs(fy) < 1e-12:
++                return float("inf")
++            return float(np.linalg.norm((projected - observed) / [fx, fy]))
+         return pixel_error
+ 
+ 
+@@ -123,7 +136,12 @@ def _compute_errors_batch(
+         projected = camera.img_from_cam(X_proc[valid])  # (M, 2)
+         pixel_errors = np.linalg.norm(projected - observed[valid], axis=1)
+         if error_type == ReprojectionErrorType.NORMALIZED:
+-            pixel_errors = pixel_errors / camera.focal_length
++            fx, fy = _camera_focal_xy(camera)
++            if abs(fx) < 1e-12 or abs(fy) < 1e-12:
++                return errors
++            pixel_errors = np.linalg.norm(
++                (projected - observed[valid]) / [fx, fy], axis=1
++            )
+         errors[valid] = pixel_errors
+ 
+     return errors
+diff --git a/gluemap/utils/cli.py b/gluemap/utils/cli.py
+index b39eb3d..00414f4 100644
+--- a/gluemap/utils/cli.py
++++ b/gluemap/utils/cli.py
+@@ -70,6 +70,27 @@ def get_args_parser() -> argparse.ArgumentParser:
+     parser.add_argument(
+         "--path_dg", default="", type=str, help="path to the doppelganger model"
+     )
++    parser.add_argument(
++        "--path_depth",
++        default="",
++        type=str,
++        help="MoGe-3 checkpoint replacing backbone depth: local model.pt or HF repo id",
++    )
++    parser.add_argument(
++        "--moge_python",
++        default="",
++        type=str,
++        help="interpreter for the MoGe-3 depth worker (torch, flex_gemm, "
++        "utils3d_moge, opencv, scipy, huggingface_hub); empty = this interpreter",
++    )
++
++    parser.add_argument(
++        "--refine_intrinsics",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="let bundle adjustment refine camera intrinsics; "
++        "--no-refine_intrinsics holds them at the seeded/GT values",
++    )
+ 
+     # IO
+     parser.add_argument(
+@@ -212,6 +233,14 @@ def get_args_parser() -> argparse.ArgumentParser:
+         type=float,
+         help="threshold for dg matching",
+     )
++    parser.add_argument(
++        "--checkpoint_every",
++        default=0,
++        type=int,
++        help="save a resumable partial result every N batches of two-view and "
++        "star inference (0 = off; ignored when distributed); a rerun with "
++        "--force_load resumes from it",
++    )
+ 
+     parser.add_argument(
+         "--retrieval_batch_size",
+diff --git a/gluemap/utils/model_loader.py b/gluemap/utils/model_loader.py
+index 811fc4e..61e474f 100644
+--- a/gluemap/utils/model_loader.py
++++ b/gluemap/utils/model_loader.py
+@@ -1,57 +1,18 @@
+ import argparse
+-import os
++import sys
+ 
+ import numpy as np
+ import torch
+ from safetensors.torch import load_file
+ 
+ import thirdparty.path_to_thirdparty  # noqa: F401  (adds all thirdparty submodules to sys.path)
+-
+-
+-def _import_vpr_model() -> type:
+-    """Import salad's :class:`VPRModel` while isolating its ``models`` package.
+-
+-    Both ``thirdparty/salad/models/`` and
+-    ``thirdparty/doppelgangers-plusplus/dust3r/croco/models/`` claim the
+-    top-level ``models`` package, so we swap ``sys.modules`` around the
+-    import to keep the two from clobbering each other.
+-    """
+-    import sys
+-
+-    if "vpr_model" in sys.modules:
+-        return sys.modules["vpr_model"].VPRModel
+-
+-    salad_path = os.path.normpath(
+-        os.path.join(os.path.dirname(__file__), "../../thirdparty/salad")
+-    )
+-    saved = {
+-        k: v
+-        for k, v in sys.modules.items()
+-        if k == "models" or k.startswith("models.")
+-    }
+-    for k in saved:
+-        del sys.modules[k]
+-    sys.path.insert(0, salad_path)
+-    try:
+-        from vpr_model import VPRModel
+-    finally:
+-        if salad_path in sys.path:
+-            sys.path.remove(salad_path)
+-        salad_models = {
+-            k: v
+-            for k, v in sys.modules.items()
+-            if k == "models" or k.startswith("models.")
+-        }
+-        for k in salad_models:
+-            del sys.modules[k]
+-        sys.modules.update(saved)
+-    return VPRModel
++from gluemap.ff_inference.moge3_depth import MoGe3WorkerClient
+ 
+ 
+ def load_models(
+     args: argparse.Namespace,
+     keys: set[str] | None = None,
+-) -> tuple[dict[str, torch.nn.Module], torch.device]:
++) -> tuple[dict[str, torch.nn.Module | MoGe3WorkerClient], torch.device]:
+     """Load and prepare the requested set of pipeline models.
+ 
+     Each entry in ``keys`` triggers loading of one model:
+@@ -60,8 +21,9 @@ def load_models(
+       pose backbones, weights from ``args.path_feedforward``.
+     * ``"dg"`` — Doppelganger++ (MASt3R), weights from ``args.path_dg``.
+     * ``"vggsfm"`` — VGGSfM tracker, weights from ``args.path_tracker``.
+-    * ``"salad"`` — SALAD VPR descriptor, weights from
++    * ``"megaloc"`` — MegaLoc VPR descriptor, safetensors from
+       ``args.path_retrieval``.
++    * ``"moge3"`` — subprocess depth worker, checkpoint from ``args.path_depth``.
+ 
+     Models are moved to CPU when ``args.cpu`` is set, otherwise to
+     ``cuda`` when available. Under ``args.distributed`` they are wrapped
+@@ -121,6 +83,9 @@ def load_models(
+     if "dg" in keys:
+         from mast3r.model import AsymmetricMASt3R
+ 
++        # The DG++ checkpoint pickles an argparse.Namespace, which
++        # weights_only=True rejects unless explicitly allowlisted.
++        torch.serialization.add_safe_globals([argparse.Namespace])
+         models["dg"] = AsymmetricMASt3R(
+             pos_embed="RoPE100",
+             patch_embed_cls="ManyAR_PatchEmbed",
+@@ -154,30 +119,19 @@ def load_models(
+             )
+         )
+ 
+-    # Load SALAD
+-    if "salad" in keys:
+-        VPRModel = _import_vpr_model()
+-        models["salad"] = VPRModel(
+-            backbone_arch="dinov2_vitb14",
+-            backbone_config={
+-                "num_trainable_blocks": 4,
+-                "return_token": True,
+-                "norm_layer": True,
+-            },
+-            agg_arch="SALAD",
+-            agg_config={
+-                "num_channels": 768,
+-                "num_clusters": 64,
+-                "cluster_dim": 128,
+-                "token_dim": 256,
+-            },
+-        )
++    # Load MegaLoc
++    if "megaloc" in keys:
++        from megaloc_model import MegaLoc
+ 
+-        models["salad"].load_state_dict(
+-            torch.load(
+-                args.path_retrieval, map_location="cpu", weights_only=False
+-            ),
+-            strict=False,
++        models["megaloc"] = MegaLoc()
++        models["megaloc"].load_state_dict(load_file(args.path_retrieval), strict=True)
++
++    if "moge3" in keys:
++        if not args.path_depth:
++            raise ValueError("MoGe-3 requires --path_depth")
++        models["moge3"] = MoGe3WorkerClient(
++            python=getattr(args, "moge_python", "") or sys.executable,
++            checkpoint=args.path_depth,
+         )
+ 
+     if getattr(args, "cpu", False):
+@@ -186,11 +140,15 @@ def load_models(
+         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+     for _model_name, model in models.items():
++        if isinstance(model, MoGe3WorkerClient):
++            continue
+         model.eval()
+         model.to(device)
+ 
+     if args.distributed:
+         for model_name, model in models.items():
++            if isinstance(model, MoGe3WorkerClient):
++                continue
+             models[model_name] = torch.nn.parallel.DistributedDataParallel(
+                 model,
+                 device_ids=[args.gpu],
+@@ -207,7 +165,7 @@ def load_models(
+ 
+ def load_all_models(
+     args: argparse.Namespace,
+-) -> tuple[dict[str, torch.nn.Module], torch.device]:
++) -> tuple[dict[str, torch.nn.Module | MoGe3WorkerClient], torch.device]:
+     """Load all pipeline models at once for reuse across datasets.
+ 
+     Respects args.use_dummy_tracks to skip VGGSfM if not needed.
+@@ -217,7 +175,7 @@ def load_all_models(
+     if getattr(args, "direct_inference", False):
+         keys = {chosen_model}
+     else:
+-        keys = {"salad", "dg", chosen_model}
++        keys = {"megaloc", "dg", chosen_model, "moge3"}
+         if not getattr(args, "use_dummy_tracks", False):
+             keys.add("vggsfm")
+     return load_models(args, keys=keys)
+diff --git a/pyproject.toml b/pyproject.toml
+index da0eb96..750f60b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -38,8 +38,6 @@ dependencies = [
+     "plyfile==1.1.3",
+     "scikit-learn==1.8.0",
+     "uniception==0.1.7",
+-    "pytorch-lightning==2.6.1",
+-    "pytorch-metric-learning==2.9.0",
+     "lightglue @ git+https://github.com/cvg/LightGlue.git@eb42fee2d71449efb0aa5c10549752b5d75384d8",
+ ]
+ 
+@@ -53,7 +51,7 @@ gluemap-benchmark = "benchmark.run_benchmark:main"
+ [tool.scikit-build]
+ cmake.source-dir = "gluemap/pybind"
+ cmake.version = ">=3.18"
+-wheel.packages = ["gluemap", "benchmark"]
++wheel.packages = ["gluemap", "benchmark", "thirdparty"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+diff --git a/tests/test_augmented_bundle_adjustment.py b/tests/test_augmented_bundle_adjustment.py
+index a17507e..f610aea 100644
+--- a/tests/test_augmented_bundle_adjustment.py
++++ b/tests/test_augmented_bundle_adjustment.py
+@@ -437,3 +437,30 @@ class TestBundleAdjustmentEndToEnd:
+         # looser thresholds than the multi-view tests above.
+         assert max_rot < 2.0, f"Max rotation error {max_rot:.4f} deg >= 2.0 deg"
+         assert max_center < 0.1, f"Max center error {max_center:.6f} >= 0.1"
++
++
++def test_fixed_intrinsics_preserved_with_real_and_virtual_tracks():
++    reconstruction = create_synthetic_reconstruction(
++        num_frames=8, num_points3D=100, seed=2
++    )
++    for camera in reconstruction.cameras.values():
++        camera.params[camera.focal_length_idxs()] *= 1.05
++    perturb_points3D(
++        reconstruction, fraction=1.0, noise_std=0.05,
++        rng=np.random.default_rng(2),
++    )
++    ids = sorted(reconstruction.point3D_ids())
++    midpoint = len(ids) // 2
++    for refine in (False, True):
++        real = split_reconstruction(reconstruction, ids[:midpoint])
++        virtual = split_reconstruction(reconstruction, ids[midpoint:])
++        before = {i: c.params.copy() for i, c in real.cameras.items()}
++        kwargs = {} if refine else {"refine_intrinsics": False}
++        bundle_adjustment(real, virtual, {}, **kwargs)
++        changed = [
++            not np.array_equal(camera.params, before[i])
++            for i, camera in real.cameras.items()
++        ]
++        assert any(changed) if refine else not any(changed)
++        for i, camera in virtual.cameras.items():
++            np.testing.assert_array_equal(camera.params, real.cameras[i].params)
+diff --git a/tests/test_inference_checkpoint.py b/tests/test_inference_checkpoint.py
+new file mode 100644
+index 0000000..817918c
+--- /dev/null
++++ b/tests/test_inference_checkpoint.py
+@@ -0,0 +1,110 @@
++"""A killed inference stage must resume from its last partial checkpoint."""
++
++import argparse
++import os
++
++import pytest
++import torch
++
++from gluemap.controllers.base_inference import BaseInferencePipeline
++
++
++class _Dataset:
++    def __len__(self):
++        return 10
++
++    def __getitem__(self, idx):
++        return {"x": torch.tensor([float(idx)]), "idx": idx}
++
++
++class _Pipeline(BaseInferencePipeline):
++    _index_key = "idx"
++    _rerun_from_triggers = None
++    _profiling_label = "Fake"
++
++    def __init__(self, args, fail_at=None):
++        super().__init__(args, 1, 0, "fake_result.pth")
++        self.fail_at = fail_at
++        self.processed = []
++
++    def _load_models(self):
++        return {}
++
++    def _create_batch_inference(self, models):
++        return None
++
++    def _run_batch_step(self, batch_inference, batch):
++        idx = int(batch["idx"])
++        if idx == self.fail_at:
++            raise RuntimeError("killed")
++        self.processed.append(idx)
++        return {"value": batch["x"] * 2}, {"times": 0.5}
++
++    def _pack_local_outputs(self, all_outputs, all_indices):
++        return {"value": [o["value"] for o in all_outputs]}
++
++    def _merge_gathered_outputs(self, data_list, index_mapping, dataset_size):
++        raise AssertionError("not distributed")
++
++    def _postprocess_global_outputs(self, global_outputs, dataset):
++        return global_outputs
++
++    def _batch_size(self):
++        return 1
++
++
++def _args(tmp_path, **overrides):
++    values = dict(
++        distributed=False, num_workers=0, force_load=True,
++        curr_path=str(tmp_path), checkpoint_every=2, rerun_from=None,
++    )
++    values.update(overrides)
++    return argparse.Namespace(**values)
++
++
++@pytest.fixture(autouse=True)
++def _no_cuda_sync(monkeypatch):
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
++
++
++def test_killed_stage_resumes_without_recomputing_checkpointed_items(tmp_path):
++    expected, _ = _Pipeline(_args(tmp_path / "reference")).run(_Dataset())
++
++    interrupted = _Pipeline(_args(tmp_path / "run"), fail_at=5)
++    with pytest.raises(RuntimeError, match="killed"):
++        interrupted.run(_Dataset())
++    assert interrupted.processed == [0, 1, 2, 3, 4]
++    assert os.path.exists(tmp_path / "run" / "fake_result.pth.partial")
++    assert not os.path.exists(tmp_path / "run" / "fake_result.pth")
++
++    resumed = _Pipeline(_args(tmp_path / "run"))
++    result, timing = resumed.run(_Dataset())
++    assert resumed.processed == [4, 5, 6, 7, 8, 9]
++    assert result["idx"] == list(range(10))
++    torch.testing.assert_close(
++        torch.cat(result["value"]), torch.cat(expected["value"])
++    )
++    assert timing["num_batches"] == 10
++    assert not os.path.exists(tmp_path / "run" / "fake_result.pth.partial")
++
++
++def test_partial_from_different_dataset_is_discarded(tmp_path):
++    with pytest.raises(RuntimeError):
++        _Pipeline(_args(tmp_path), fail_at=5).run(_Dataset())
++
++    class _Shorter(_Dataset):
++        def __len__(self):
++            return 8
++
++    fresh = _Pipeline(_args(tmp_path))
++    result, _ = fresh.run(_Shorter())
++    assert fresh.processed == list(range(8))
++    assert result["idx"] == list(range(8))
++
++
++def test_checkpointing_off_by_default_leaves_no_partial(tmp_path):
++    with pytest.raises(RuntimeError):
++        _Pipeline(
++            _args(tmp_path, checkpoint_every=0), fail_at=5
++        ).run(_Dataset())
++    assert not os.path.exists(tmp_path / "fake_result.pth.partial")
+diff --git a/tests/test_moge3_depth.py b/tests/test_moge3_depth.py
+new file mode 100644
+index 0000000..7ba18a4
+--- /dev/null
++++ b/tests/test_moge3_depth.py
+@@ -0,0 +1,125 @@
++"""CPU regressions for content coordinates and scale-aligned depth replacement."""
++
++import math
++
++import numpy as np
++import pytest
++import torch
++
++from gluemap.ff_inference.local_inference import LocalInference
++from gluemap.ff_inference.moge3_depth import (
++    MoGe3DepthLocalInference,
++    align_moge_depth,
++    content_box,
++)
++from gluemap.utils.load_fn import calculate_image_shapes
++
++
++def test_content_box_wulai_resolutions():
++    shapes = [(1080, 1920), (1512, 2688), (2160, 3840)]
++    changes = calculate_image_shapes(shapes, (518, 518))
++    for shape, change in zip(shapes, changes):
++        assert content_box(change, shape, (518, 518)) == (0, 112, 518, 294)
++    change = calculate_image_shapes(shapes[:1], (294, 518))[0]
++    assert content_box(change, shapes[0], (294, 518)) == (0, 0, 518, 294)
++
++
++@pytest.mark.parametrize('change', [(0, 1, 0, 0), (1, 1, -1, 0), (1, 1, 1, 0)])
++def test_content_box_rejects_empty_or_outside_canvas(change):
++    with pytest.raises(ValueError):
++        content_box(change, (20, 30), (20, 30))
++
++
++def test_alignment_rejects_low_confidence_corruption_and_confident_outliers():
++    generator = torch.Generator().manual_seed(7)
++    moge = torch.rand((40, 50), generator=generator) + 0.5
++    backbone = 3.7 * moge
++    confidence = torch.zeros_like(moge)
++    confidence[:20] = 10
++    backbone[20:] *= 5
++    outliers = torch.randperm(1000, generator=generator)[:100]
++    backbone[:20].reshape(-1)[outliers] *= (
++        torch.rand((100,), generator=generator) * 20 + 2
++    )
++    scale = align_moge_depth(backbone, confidence, moge, torch.ones_like(moge, dtype=torch.bool))
++    assert scale == pytest.approx(3.7, abs=1e-5)
++    valid = torch.zeros_like(moge, dtype=torch.bool)
++    valid.reshape(-1)[:99] = True
++    assert align_moge_depth(backbone, confidence, moge, valid) is None
++    # Enough eligible pixels but fewer than 100 survive the confidence cutoff.
++    valid.reshape(-1)[:150] = True
++    confidence = torch.arange(2000).reshape(40, 50).float()
++    assert align_moge_depth(backbone, confidence, moge, valid) is None
++
++
++class StubBackbone(LocalInference):
++    def __init__(self):
++        super().__init__(torch.nn.Identity(), 'cpu', torch.float32)
++        self.depth = torch.full((1, 2, 518, 518, 1), 99.0)
++        self.depth[:, :, 112:406] = 6.0
++        self.conf = torch.ones((1, 2, 518, 518))
++        self.intrinsics = torch.eye(3).repeat(1, 2, 1, 1)
++        self.intrinsics[..., 0, 0] = 400
++        self.extrinsics = torch.eye(4).repeat(1, 2, 1, 1)
++
++    def predict(self, batch):
++        return {
++            'depth': self.depth.clone(),
++            'depth_conf': self.conf,
++            'intrinsics': self.intrinsics,
++            'extrinsics': self.extrinsics,
++        }
++
++
++class StubClient:
++    def __init__(self, all_invalid):
++        self.all_invalid = all_invalid
++        self.requests = []
++
++    def infer_depth(self, keys, images, fov_x):
++        self.requests.append((keys, images.copy(), fov_x.copy()))
++        n, _, h, w = images.shape
++        depth = np.full((n, h, w), 2.0, dtype=np.float32)
++        depth[:, :, int(0.7 * w):] = 2.5
++        valid = np.ones((n, h, w), dtype=bool)
++        valid[:, :10] = False
++        if self.all_invalid:
++            valid[:] = False
++        return depth, valid
++
++
++@pytest.mark.parametrize('all_invalid', [False, True])
++def test_replacement_preserves_padding_invalid_pixels_and_backbone_metadata(all_invalid):
++    images = torch.rand((1, 2, 3, 518, 518), generator=torch.Generator().manual_seed(11))
++    shapes = [(1080, 1920)] * 2
++    batch = {
++        'images': images,
++        'images_change': torch.tensor(calculate_image_shapes(shapes, (518, 518))),
++        'images_shape_ori': torch.tensor(shapes),
++        'image_paths': [('first.jpg',), ('second.jpg',)],
++    }
++    batch['images_change'] = batch['images_change'][None]
++    batch['images_shape_ori'] = batch['images_shape_ori'][None]
++    backbone = StubBackbone()
++    client = StubClient(all_invalid)
++    pred = MoGe3DepthLocalInference(backbone, client).predict(batch)
++    keys, crops, fovs = client.requests[0]
++    assert keys == ['first.jpg', 'second.jpg']
++    np.testing.assert_array_equal(crops, images[0, :, :, 112:406].numpy())
++    np.testing.assert_allclose(fovs, math.degrees(2 * math.atan(518 / 800)))
++    expected = backbone.depth.clone()
++    if not all_invalid:
++        expected[:, :, 122:406, int(0.7 * 518):] = 7.5
++    torch.testing.assert_close(pred['depth'], expected, rtol=0, atol=1e-6)
++    assert pred['depth_conf'] is backbone.conf
++    assert pred['intrinsics'] is backbone.intrinsics
++    assert pred['extrinsics'] is backbone.extrinsics
++
++
++def test_replacement_rejects_non_canvas_backbone_depth():
++    backbone = StubBackbone()
++    backbone.depth = backbone.depth[:, :, ::2, ::2]
++    with pytest.raises(ValueError, match='input canvas resolution'):
++        MoGe3DepthLocalInference(backbone, StubClient(False)).predict(
++            {'images': torch.zeros((1, 2, 3, 518, 518))}
++        )
+diff --git a/tests/test_reprojection_error.py b/tests/test_reprojection_error.py
+new file mode 100644
+index 0000000..ec15a24
+--- /dev/null
++++ b/tests/test_reprojection_error.py
+@@ -0,0 +1,28 @@
++"""Normalized reprojection errors must respect both PINHOLE focal lengths."""
++
++import numpy as np
++import pycolmap
++
++from gluemap.math.reprojection_error import (
++    ReprojectionErrorType,
++    _compute_errors_batch,
++    compute_point_error,
++)
++
++
++def test_pinhole_normalized_error_uses_per_axis_focals():
++    camera = pycolmap.Camera(
++        model='PINHOLE', width=1920, height=1080,
++        params=[1000, 500, 960, 540],
++    )
++    point = np.array([0.0, 0.0, 5.0])
++    observed = np.array([970.0, 545.0])
++    single = compute_point_error(
++        point, np.eye(3), np.zeros(3), observed,
++        camera, ReprojectionErrorType.NORMALIZED,
++    )
++    batch = _compute_errors_batch(
++        point[None], observed[None], camera,
++        np.array([False]), ReprojectionErrorType.NORMALIZED,
++    )
++    np.testing.assert_allclose([single, batch[0]], np.sqrt(2) * 0.01, rtol=1e-12)
+diff --git a/thirdparty/__init__.py b/thirdparty/__init__.py
+new file mode 100644
+index 0000000..097348d
+--- /dev/null
++++ b/thirdparty/__init__.py
+@@ -0,0 +1 @@
++"""Vendored dependencies belonging to this GLUEMAP checkout."""
+diff --git a/thirdparty/path_to_thirdparty.py b/thirdparty/path_to_thirdparty.py
+index 45f7ea0..2de7c7e 100644
+--- a/thirdparty/path_to_thirdparty.py
++++ b/thirdparty/path_to_thirdparty.py
+@@ -14,6 +14,7 @@ SUBMODULES = {
+     ),
+     "vggt": path.join("vggt", "vggt", "models"),
+     "mapanything": path.join("mapanything", "mapanything", "models"),
++    "megaloc": path.join("megaloc", "megaloc_model.py"),
+ }
+ 
+ # vggsfm lives directly under thirdparty/ (not a git submodule) and uses

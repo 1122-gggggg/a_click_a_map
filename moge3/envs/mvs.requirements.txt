@@ -1,0 +1,18 @@
+# MVSFormer++ inference env (python 3.12). torch comes from the cu128 index (see setup_envs.sh).
+torch==2.11.0
+torchvision==0.26.0
+numpy==2.5.4
+scipy==1.17.1
+opencv-python==4.13.0.92
+timm==1.0.27
+kornia==0.8.3
+einops==0.8.2
+pillow
+matplotlib
+tqdm
+pyyaml==6.0.3
+plyfile==1.1.5
+omegaconf==2.4.0
+tensorboardx==2.6.5
+protobuf==7.36.2
+easydict==1.13

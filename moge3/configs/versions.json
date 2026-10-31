@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "description": "Pinned sources and weights for the MoGe-3 + MegaLoc GlueMap entry point (run_moge3.sh).",
+  "sources": {
+    "gluemap": {
+      "url": "https://github.com/colmap/gluemap",
+      "commit": "adc9e4bb5f41014d3f7c157a879edc278588c829",
+      "patch": "moge3/patches/gluemap-moge3-megaloc.patch",
+      "submodules": ["thirdparty/doppelgangers-plusplus", "thirdparty/mapanything", "thirdparty/pi3", "thirdparty/vggt"]
+    },
+    "moge": {
+      "url": "https://github.com/microsoft/MoGe",
+      "commit": "74fbce054ebed49800de42d0ad0e83495065719a",
+      "dest": "thirdparty/moge"
+    },
+    "megaloc": {
+      "url": "https://github.com/gmberton/MegaLoc",
+      "commit": "5fe0dd697c4a70ba3e23607f6716ab3c606b16db",
+      "dest": "thirdparty/megaloc"
+    },
+    "edm": {
+      "url": "https://github.com/chicleee/EDM",
+      "commit": "8a31d81d3babc6a9d73e4a3b6f8ba88b0281b3c7",
+      "patch": "patches/edm.patch"
+    },
+    "mvsformerpp": {
+      "url": "https://github.com/maybeLx/MVSFormerPlusPlus",
+      "commit": "bdd980cfbae9a863b5489e2ed973612b192d11a5",
+      "patch": "moge3/patches/mvsformerpp-sdpa.patch"
+    }
+  },
+  "weights": {
+    "pi3.safetensors": {"sha256": "33580e4702ac671558aedeab1148fd08118f7ce45bdbeb99f3e3cf340062875d", "hf_repo": "yyfz233/Pi3", "hf_file": "model.safetensors"},
+    "tracker.bin": {"sha256": "451f1d218be1ef661c81d6254cbc633a5190e7d6069fe51621cc29ba5d90a404", "url": "https://huggingface.co/facebook/VGGSfM/resolve/main/vggsfm_v2_tracker.pt"},
+    "dg.pth": {"sha256": "480b92bda771cabd7be6e8c756b986784118361e3f1ff1489d5bf49ac6382300", "hf_repo": "doppelgangers25/doppelgangers_plusplus", "hf_file": "checkpoint-dg+visym.pth"},
+    "megaloc.safetensors": {"sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8", "hf_repo": "gberton/MegaLoc", "hf_file": "model.safetensors", "hf_revision": "37bb43d65dd6388d1578052de5eb0bcdceb497e7"},
+    "moge3.pt": {"sha256": "9b41b7b9f65ad80aab7ad686f5e9cc0d1fd33f1964022618dfbcd52fc1fb7925", "hf_repo": "Ruicheng/moge-3-vitl", "hf_file": "model.pt", "hf_revision": "184008f877d7ad1ad4c2cd2182a9bd1f63d0e5be"},
+    "edm.ckpt": {"sha256": "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97", "supplied_by_user": "ACAM_EDM_CHECKPOINT (edm_outdoor.ckpt)"},
+    "mvsformerpp.pth": {"sha256": "666404611dbffb6d02adc2380a9d6e6cb56e14cef1ae5a5160eda723a922a0d6", "supplied_by_user": "ACAM_MVS_CHECKPOINT (official tnt_ckpt/model_best.pth, see MVSFormer++ README for the download link)"},
+    "mvsformerpp_config.json": {"sha256": "b90280021368d8578725e685de8b4621b0b9d83bbeaf9689d4818d776ba5f473", "supplied_by_user": "ACAM_MVS_CONFIG (official tnt_ckpt/config.json)"}
+  }
+}

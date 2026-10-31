@@ -6,3 +6,12 @@ Third-party code is NOT vendored except where stated:
   the patches; check each upstream license before redistributing derived trees.
 - Model weights (Pi3, SALAD, VGGSfM, Doppelgangers++, MegaLoc, EDM) are downloaded or supplied by
   the user and are subject to their own licenses.
+
+MoGe-3 entry point (run_moge3.sh, moge3/):
+- moge3/patches/gluemap-moge3-megaloc.patch modifies colmap/gluemap (BSD-3) at the commit pinned in
+  moge3/configs/versions.json; moge3/patches/mvsformerpp-sdpa.patch modifies maybeLx/MVSFormerPlusPlus (Apache-2.0).
+  `moge3/scripts/setup.sh` clones the upstream repositories (and microsoft/MoGe, MIT; gmberton/MegaLoc, MIT) at pinned
+  commits and applies the patches; nothing from those trees is vendored here.
+- moge3/portable_pipeline/ is original code of this repository (MIT).
+- Weights (Pi3, VGGSfM, Doppelgangers++, MegaLoc, MoGe-3, EDM, MVSFormer++) are downloaded or supplied by the user and are
+  subject to their own licenses; check them before redistributing a bundle that contains weights.
