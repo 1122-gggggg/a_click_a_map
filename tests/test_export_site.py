@@ -169,16 +169,26 @@ def test_export_matches_delivery_tree_with_optional_dense(tmp_path: Path) -> Non
     dense_src = run / "products/map/dense/dense.ply"
     dense_src.parent.mkdir(parents=True, exist_ok=True)
     dense_src.write_bytes(b"0123456789ABCDEF")
-    site2 = export.export_site(run, tmp_path / "s2", site_id="treecheck",
-                               display_name="Tree", release_id="treecheck_20261118")
-    assert (site2 / "map/map_dense.ply").is_file()
-    bundle = _json.loads((site2 / "localization/direct_bundle.json").read_text(encoding="utf-8"))
-    assert "../map/map_dense.ply" in [e["path"] for e in bundle["files"]]
+    from zipfile import ZipFile
 
+    zip_out = tmp_path / "s2"
+    assert main(["export-site", str(run), "--out", str(zip_out), "--site-id", "treecheck",
+                 "--display-name", "Tree", "--release-id", "treecheck_20261118", "--zip"]) == 0
+    archive = zip_out / "treecheck.zip"
+    assert list(zip_out.iterdir()) == [archive]
+    with ZipFile(archive) as package:
+        root = "treecheck/"
+        assert all(name.startswith(root) for name in package.namelist())
+        payload = {name.removeprefix(root) for name in package.namelist()}
+        assert payload == {p.relative_to(site).as_posix() for p in site.rglob("*") if p.is_file()} | {"map/map_dense.ply"}
+        assert package.read(root + "map/map_dense.ply") == dense_src.read_bytes()
+        bundle = _json.loads(package.read(root + "localization/direct_bundle.json"))
+        assert "../map/map_dense.ply" in [e["path"] for e in bundle["files"]]
 
-def test_failed_export_does_not_leave_a_partial_delivery(tmp_path: Path) -> None:
+@pytest.mark.parametrize("zip_output", [False, True])
+def test_failed_export_does_not_leave_a_partial_delivery(tmp_path: Path, zip_output: bool) -> None:
     out = tmp_path / "delivery"
-    ids = {"site_id": "retry", "display_name": "Retry", "release_id": "retry_v1"}
+    ids = {"site_id": "retry", "display_name": "Retry", "release_id": "retry_v1", "zip_output": zip_output}
     ambiguous = _synthetic_run(tmp_path / "ambiguous", n_images=1, n_points=10)
     with pytest.raises(ValueError, match="do not determine a unique gravity axis"):
         export.export_site(ambiguous, out, **ids)
@@ -186,6 +196,6 @@ def test_failed_export_does_not_leave_a_partial_delivery(tmp_path: Path) -> None
 
     valid = _synthetic_run(tmp_path / "valid", n_images=20, n_points=20)
     site = export.export_site(valid, out, **ids)
-    assert (site / "site_profile.json").is_file()
-    with pytest.raises(FileExistsError, match="site folder already exists"):
+    assert site.is_file() if zip_output else (site / "site_profile.json").is_file()
+    with pytest.raises(FileExistsError, match="already exists"):
         export.export_site(valid, out, **ids)

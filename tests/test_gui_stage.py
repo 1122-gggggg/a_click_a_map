@@ -179,7 +179,29 @@ def test_pack_result_lists_bundle(tmp_path) -> None:
     bundle.write_bytes(b"x" * 10)
     rows = jobs.pack_result({"result_dir": str(tmp_path)})
     assert len(rows) == 1 and rows[0]["path"] == str(bundle)
-    assert jobs.map_bundle(str(tmp_path)) == bundle
+
+
+def _finished_export_job(tmp_path: Path, payload: Path) -> dict:
+    return {"id": "exported", "kind": "export", "engine": "original", "status": "done", "name": "mymap",
+            "result_dir": str(payload)}
+
+
+def test_export_result_routes_zip_and_import_folder(tmp_path: Path) -> None:
+    archive = tmp_path / "場域交付" / "mymap.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"PCK" + bytes(1024))
+    site = tmp_path / "場域交付" / "mymap"
+    site.mkdir()
+    (site / "site_profile.json").write_text("{}")
+    for name in ("map", "localization", "model", "keyframes"):
+        (site / name).mkdir()
+    zip_rows = jobs.export_result(_finished_export_job(tmp_path, archive))
+    folder_rows = jobs.export_result(_finished_export_job(tmp_path, site))
+    nested = [row for row in folder_rows if row["path"] == str(site)]
+    assert zip_rows[0]["path"] == str(archive) and "ZIP" in zip_rows[0]["label"]
+    assert folder_rows[0]["path"] == str(site) and nested
+    assert not jobs.export_result(_finished_export_job(tmp_path, tmp_path / "missing.zip"))
+    assert jobs.delivery_archive(tmp_path / "othermap") == tmp_path / "othermap" / "場域交付" / "othermap.zip"
 
 
 def test_densest_point_ignores_runaways(tmp_path: Path) -> None:

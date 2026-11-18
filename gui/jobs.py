@@ -497,27 +497,38 @@ def delivery_site(map_dir: str | Path) -> Path:
     return base / "場域交付" / site_id
 
 
+def delivery_archive(map_dir: str | Path) -> Path:
+    site = delivery_site(map_dir)
+    return site.with_name(f"{site.name}.zip")
+
+
 def _build_export_command(map_dir: str | Path) -> tuple[list[str], dict]:
     base = Path(map_dir).expanduser().resolve()
     run = base / "run"
     if not run.is_dir() or not is_map_approved(base)[0]:
         raise ValueError("找不到已確認的建圖成果，請先完成 3D 檢查")
-    site = delivery_site(base)
-    if site.exists():
-        raise ValueError(f"交付資料夾已存在：{site}")
-    cmd = [str(REPO / "run.sh"), "export-site", str(run), "--out", str(site.parent),
-           "--site-id", site.name, "--display-name", base.name]
-    return cmd, {"name": base.name, "result_dir": str(site)}
+    archive = delivery_archive(base)
+    if archive.exists():
+        raise ValueError(f"交付壓縮包已存在：{archive}")
+    cmd = [str(REPO / "run.sh"), "export-site", str(run), "--out", str(archive.parent),
+           "--site-id", archive.stem, "--display-name", base.name, "--zip"]
+    return cmd, {"name": base.name, "result_dir": str(archive)}
 
 
 def _dir_size(root: Path) -> int:
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file() and not path.is_symlink())
 
 
+def _archive_row(path: Path) -> dict:
+    return {"label": "搬到另一台電腦的場域 ZIP", "path": str(path), "size": human(path.stat().st_size)}
+
+
 def export_result(job: dict) -> list[dict]:
     if job["status"] != "done":
         return []
     site = Path(job["result_dir"])
+    if site.is_file() and site.suffix == ".zip":
+        return [_archive_row(site)]
     profile = site / "site_profile.json"
     folders = [site / name for name in ("map", "localization", "model", "keyframes")]
     if not profile.is_file() or not all(folder.is_dir() for folder in folders):
@@ -781,8 +792,11 @@ def map_result(job: dict) -> list[dict]:
                   ("稠密點雲 (MVSFormer++)", "run/products/map/dense/dense.ply")]
     rows = []
     if job["engine"] == "original":
+        archive = delivery_archive(base)
         site = delivery_site(base)
-        if (site / "site_profile.json").is_file():
+        if archive.is_file():
+            rows.append(_archive_row(archive))
+        elif (site / "site_profile.json").is_file():
             rows.append({"label": "搬這整個場域資料夾", "path": str(site), "size": ""})
     for label, rel in wanted:
         path = base / rel

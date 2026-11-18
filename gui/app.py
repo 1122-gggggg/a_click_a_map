@@ -710,8 +710,8 @@ class App(Gtk.Window):
         self.approve_button.set_tooltip_text("在上方 3D 檢視裡轉一轉、確認地圖沒有明顯問題後再按。按了巡航定位才會放行。")
         self.approve_button.connect("clicked", self.approve_current_map)
         approval_row.pack_start(self.approve_button, False, False, 0)
-        self.export_button = Gtk.Button(label="匯出場域")
-        self.export_button.set_tooltip_text("產生另一台電腦可用「＋新增地圖」匯入的場域資料夾")
+        self.export_button = Gtk.Button(label="匯出場域 ZIP")
+        self.export_button.set_tooltip_text("產生要搬到另一台電腦的壓縮包；解壓後用「＋新增地圖」匯入")
         self.export_button.set_no_show_all(True)
         self.export_button.connect("clicked", self.export_current_map)
         approval_row.pack_start(self.export_button, False, False, 0)
@@ -1002,11 +1002,14 @@ class App(Gtk.Window):
     def open_folder(self, _button=None) -> None:
         if self.selected:
             try:
-                folder = jobs.read_job(self.selected).get("result_dir")
+                result = jobs.read_job(self.selected).get("result_dir")
             except (OSError, ValueError):
                 return
-            if folder and Path(folder).exists():
-                subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result:
+                path = Path(result)
+                folder = path.parent if path.is_file() else path
+                if folder.is_dir():
+                    subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def open_result_row(self, view: Gtk.TreeView, path: Gtk.TreePath, _column) -> None:
         row = self.file_store[path]
@@ -1255,7 +1258,7 @@ class App(Gtk.Window):
         self.approve_button.set_sensitive(bool(self.viewer_info) or approved)
         self.export_button.set_visible(
             approved and self.approved_engine == "original"
-            and not (jobs.delivery_site(self.approved_dir) / "site_profile.json").is_file()
+            and not jobs.delivery_archive(self.approved_dir).is_file()
         )
 
     def approve_current_map(self, _button=None) -> None:
@@ -1277,20 +1280,20 @@ class App(Gtk.Window):
         if not self.approved_dir or self.approved_engine != "original":
             return
         base = Path(self.approved_dir)
-        site = jobs.delivery_site(base)
-        if (site / "site_profile.json").is_file():
+        archive = jobs.delivery_archive(base)
+        if archive.is_file():
             return
         dense = "\n• map/map_dense.ply（稠密點雲）" if (base / "run/products/map/dense/dense.ply").is_file() else ""
         dialog = Gtk.MessageDialog(
             transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO, text="要匯出到另一台電腦使用的場域嗎？",
+            buttons=Gtk.ButtonsType.YES_NO, text="要匯出給另一台電腦的場域 ZIP 嗎？",
         )
         dialog.format_secondary_text(
-            f"{site}\n\n"
+            f"{archive}\n\n"
             f"• site_profile.json（場域設定）\n• map/map.ply（RGB 主地圖）{dense}\n"
             "• localization/（定位設定、對齊、參考資料）\n"
             "• model/（COLMAP 模型）\n• keyframes/（關鍵影格 JPEG 與清單）\n\n"
-            "不包含原始影片或航線。匯出完成後請搬整個場域資料夾。"
+            "只要搬這個 ZIP，不包含原始影片或航線。到另一台電腦後請先解壓縮。"
         )
         answer = dialog.run()
         dialog.destroy()
@@ -1330,9 +1333,11 @@ class App(Gtk.Window):
             for row in rows:
                 self.file_store.append([row["label"], row["path"], row["size"]])
             if rows:
+                path = Path(rows[0]["path"])
+                action = "複製這個 ZIP 並解壓縮" if path.is_file() else "複製整個資料夾"
                 self.transfer_hint.set_text(
-                    f"搬到另一台電腦：{rows[0]['path']}\n"
-                    "把這個資料夾整個複製過去，再在定位端按「＋新增地圖」選它（直接包含 site_profile.json 的那一層）。"
+                    f"搬到另一台電腦：{path}\n"
+                    f"{action}，再在定位端按「＋新增地圖」選直接包含 site_profile.json 的資料夾。"
                 )
                 self.transfer_hint.show()
                 self.result_stack.set_visible_child_name("files")
@@ -1341,8 +1346,8 @@ class App(Gtk.Window):
                     "failed": "匯出失敗：請看上方日誌，排除原因後再續跑。",
                     "stopped": "匯出已停止。",
                     "interrupted": "匯出已中斷。",
-                    "done": "找不到已匯出的場域資料夾，可能已經搬移。",
-                }.get(job["status"], "正在匯出場域，完成後會列出要搬的檔案。")
+                    "done": "找不到已匯出的場域交付檔案，可能已經搬移。",
+                }.get(job["status"], "正在產生場域 ZIP，完成後會顯示要搬的檔案。")
                 self.result_hint.set_text(hint)
                 self.result_stack.set_visible_child_name("hint")
             return

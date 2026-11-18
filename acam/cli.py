@@ -303,7 +303,8 @@ def cmd_export_site(args: argparse.Namespace) -> int:
     release = args.release_id or f"{args.site_id}_{datetime.date.today():%Y%m%d}"
     try:
         site = export_site(args.run, args.out, site_id=args.site_id,
-                           display_name=args.display_name or args.site_id, release_id=release)
+                           display_name=args.display_name or args.site_id, release_id=release,
+                           zip_output=args.zip_output)
     except (ValueError, OSError) as error:
         say(f"export-site failed: {error}")
         return 3
@@ -347,12 +348,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--out", type=Path, default=Path("localize_out"))
     q.set_defaults(func=cmd_localize)
     s = sub.add_parser("setup", help="clone/patch third-party code and download checkpoints")
-    e = sub.add_parser("export-site", help="export a finished run as a localization-side site folder")
+    e = sub.add_parser("export-site", help="export a finished run as a localization site folder or ZIP")
     e.add_argument("run", type=Path, help="finished run dir (contains artifacts/ and products/)")
-    e.add_argument("--out", type=Path, required=True, help="output dir holding <site_id>/")
+    e.add_argument("--out", type=Path, required=True, help="output directory")
     e.add_argument("--site-id", required=True, help="path-safe slug, e.g. riverside02")
     e.add_argument("--display-name", default="")
     e.add_argument("--release-id", default="")
+    e.add_argument("--zip", dest="zip_output", action="store_true", help="write <site_id>.zip instead of a folder")
     e.set_defaults(func=cmd_export_site)
     s.add_argument("rest", nargs=argparse.REMAINDER)
     s.set_defaults(func=cmd_setup)

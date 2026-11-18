@@ -37,6 +37,7 @@ import struct
 import sys
 import tempfile
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 
@@ -243,18 +244,28 @@ def find_run_model(run: Path) -> Path:
     return model
 
 
-def export_site(run: Path, out: Path, *, site_id: str, display_name: str, release_id: str) -> Path:
-    """Build the localization-side site folder from a finished original-entry run."""
+def export_site(run: Path, out: Path, *, site_id: str, display_name: str, release_id: str,
+                zip_output: bool = False) -> Path:
+    """Build a localization-side site folder or a ZIP containing that folder."""
     if not site_id or not site_id.replace(".", "").replace("_", "").replace("-", "").isalnum():
         raise ValueError(f"bad site_id {site_id!r}: letters, digits, dot, underscore, hyphen")
-    final = out / site_id
+    final = out / (f"{site_id}.zip" if zip_output else site_id)
     if final.exists() or final.is_symlink():
-        raise FileExistsError(f"site folder already exists: {final}")
+        kind = "ZIP archive" if zip_output else "site folder"
+        raise FileExistsError(f"{kind} already exists: {final}")
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".export-", dir=out) as staging:
         site = Path(staging) / site_id
         _write_site(run, site, site_id=site_id, display_name=display_name, release_id=release_id)
-        site.rename(final)
+        if zip_output:
+            archive = Path(staging) / final.name
+            with ZipFile(archive, "w", compression=ZIP_DEFLATED, compresslevel=1) as bundle:
+                for file in sorted(site.rglob("*")):
+                    if file.is_file():
+                        bundle.write(file, arcname=file.relative_to(site.parent).as_posix())
+            archive.rename(final)
+        else:
+            site.rename(final)
     return final
 
 
@@ -451,16 +462,18 @@ def _write_site(run: Path, site: Path, *, site_id: str, display_name: str, relea
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, prog="acam-export-site")
     parser.add_argument("run", type=Path, help="finished run dir (contains artifacts/, products/)")
-    parser.add_argument("--out", type=Path, required=True, help="output dir holding <site_id>/")
+    parser.add_argument("--out", type=Path, required=True, help="output directory")
     parser.add_argument("--site-id", required=True, help="path-safe slug, e.g. riverside02")
     parser.add_argument("--display-name", default="", help="human name (defaults to site-id)")
     parser.add_argument("--release-id", default="", help="map revision id (defaults to <site_id>_<date>)")
+    parser.add_argument("--zip", dest="zip_output", action="store_true", help="write <site_id>.zip instead of a folder")
     args = parser.parse_args(argv)
     import datetime
     release = args.release_id or f"{args.site_id}_{datetime.date.today():%Y%m%d}"
     try:
         site = export_site(args.run, args.out, site_id=args.site_id,
-                           display_name=args.display_name or args.site_id, release_id=release)
+                           display_name=args.display_name or args.site_id, release_id=release,
+                           zip_output=args.zip_output)
     except (ValueError, OSError) as error:
         print(f"export-site failed: {error}", file=sys.stderr)
         return 1
