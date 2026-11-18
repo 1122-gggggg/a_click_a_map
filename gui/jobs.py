@@ -24,6 +24,52 @@ LOCK = threading.Lock()
 PROCS: dict[str, subprocess.Popen] = {}
 
 
+GUI_LOCK = JOBS.parent / "gui.lock"
+_LOCK_OWNER = 0
+
+
+def _gui_owner_alive(pid: int) -> bool:
+    """Whether `pid` is a live process running this desktop app."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except OSError:
+        return False
+    return b"gui/app.py" in cmdline
+
+
+def acquire_gui_lock(path: Path = GUI_LOCK) -> bool:
+    """Single-instance guard for the desktop app: True if we now own the lock.
+
+    A crashed previous run leaves a stale file behind; it is reclaimed when its
+    PID is gone (or no longer runs this app).
+    """
+    global _LOCK_OWNER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old_pid = 0
+    try:
+        old_pid = int(json.loads(path.read_text(encoding="utf-8")).get("pid", 0))
+    except (OSError, ValueError, AttributeError):
+        old_pid = 0
+    if old_pid and _gui_owner_alive(old_pid):
+        return False
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    tmp.replace(path)
+    _LOCK_OWNER = os.getpid()
+    return True
+
+
+def release_gui_lock(path: Path = GUI_LOCK) -> None:
+    """Give up the lock, but only if we own it."""
+    global _LOCK_OWNER
+    try:
+        owned = _LOCK_OWNER == os.getpid() == int(json.loads(path.read_text(encoding="utf-8")).get("pid", 0))
+    except (OSError, ValueError, AttributeError):
+        owned = False
+    if owned:
+        _LOCK_OWNER = 0
+        path.unlink(missing_ok=True)
+
 def toolkit() -> Path:
     return Path(os.environ.get("MOGE3_TOOLKIT", REPO / "third_party/moge3"))
 

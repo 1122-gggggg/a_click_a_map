@@ -874,6 +874,7 @@ class App(Gtk.Window):
             if answer != Gtk.ResponseType.YES:
                 return True
             jobs.stop_all()
+        jobs.release_gui_lock()
         Gtk.main_quit()
         return False
 
@@ -1048,6 +1049,12 @@ class App(Gtk.Window):
 
 
 def main() -> None:
+    if not jobs.acquire_gui_lock():
+        dialog = Gtk.MessageDialog(modal=True, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,
+                                   text="程式已經在執行中，請在工作列或桌面上找既有的視窗。")
+        dialog.run()
+        dialog.destroy()
+        return
     window = App()
     window.show_all()
     Gtk.main()
