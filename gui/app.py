@@ -3,8 +3,11 @@
 
     ./gui.sh
 
-建圖: add videos, press 開始建圖, watch the log, open the results.
-巡航定位: pick a finished map and a query video; shows coverage, status counts and the flown trajectory.
+操作只有兩條路（二選一），都在左邊分頁：
+    建圖：     ① 加入影片 → ② 取名＋選輸出位置 → ③ 按「開始建圖」
+    巡航定位： ① 選一張已建好的地圖 → ② 選一部巡航影片 → ③ 按「開始巡航定位」
+右邊顯示任務列表、執行日誌與結果。按鈕在條件沒湊齊時會變灰，
+下方會直接告訴你還缺什麼（不用等到按下去才被罵）。
 Works with both entry points of this repository: ./run_moge3.sh (MoGe-3 version) and ./run.sh (original).
 Needs the distribution's python3 with PyGObject + GTK 3 (Ubuntu desktop has it: python3-gi, gir1.2-gtk-3.0).
 """
@@ -38,10 +41,13 @@ CSS = b"""
 .title { font-size: 19pt; font-weight: bold; }
 .sub { color: #6e7781; }
 .step { font-weight: bold; }
+.step-done { font-weight: bold; color: #1a7f37; }
 .hint { color: #6e7781; font-size: 10pt; }
+.ready { color: #1a7f37; font-size: 10pt; font-weight: bold; }
+.notready { color: #9a6700; font-size: 10pt; }
 .warn { color: #cf222e; font-size: 10pt; }
-button.go { font-weight: bold; font-size: 13pt; padding: 8px 22px; background-image: none; background-color: #1a7f37; color: #ffffff; }
-button.go:disabled { background-color: #94d3a2; }
+button.go { font-weight: bold; font-size: 13pt; padding: 10px 22px; background-image: none; background-color: #1a7f37; color: #ffffff; }
+button.go:disabled { background-color: #94d3a2; color: #f0f0f0; }
 textview.log, textview.log text { background-color: #0d1117; color: #e6edf3; font-family: monospace; font-size: 9pt; }
 """
 
@@ -114,6 +120,13 @@ def pixbuf_from_png(data: bytes) -> GdkPixbuf.Pixbuf:
     return loader.get_pixbuf()
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
 class App(Gtk.Window):
     def __init__(self) -> None:
         super().__init__(title=TITLE)
@@ -123,13 +136,16 @@ class App(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.engines = jobs.engine_status()
         self.engine = "moge3" if self.engines["moge3"]["ready"] or not self.engines["original"]["ready"] else "original"
+        self.radios: dict[str, Gtk.RadioButton] = {}
         self.selected: str | None = None
         self.log_offset = 0
         self.shown: tuple[str, str] | None = None
         self.signature: tuple = ()
         self.plot_points: list = []
         self.plot_width = 0
+        self.plot_span = ""
         self.cruise_maps: dict[str, str] = {}
+        self.autoscroll = True
         self._build()
         jobs.mark_interrupted()
         self.connect("delete-event", self.on_close)
@@ -145,117 +161,178 @@ class App(Gtk.Window):
         head.pack_start(css_label(TITLE, "title"), False, False, 0)
         head.pack_start(css_label(str(jobs.REPO), "sub"), False, False, 0)
         root.pack_start(head, False, False, 0)
+        root.pack_start(self._engine_bar(), False, False, 0)
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         root.pack_start(paned, True, True, 0)
 
         notebook = self.notebook = Gtk.Notebook()
         notebook.set_size_request(470, -1)
-        notebook.append_page(self._map_page(), Gtk.Label(label="  建圖  "))
-        notebook.append_page(self._cruise_page(), Gtk.Label(label="  巡航定位  "))
+        notebook.append_page(self._map_page(), Gtk.Label(label="  ① 建圖  "))
+        notebook.append_page(self._cruise_page(), Gtk.Label(label="  ② 巡航定位  "))
         paned.pack1(notebook, False, False)
         paned.pack2(self._right(), True, False)
         paned.set_position(480)
 
-    def engine_box(self) -> Gtk.Widget:
+    def _engine_bar(self) -> Gtk.Widget:
+        """A single engine switch for the whole window (both tabs share it)."""
+        frame = Gtk.Frame(label=" 建圖方式（兩頁共用，先選這個） ")
+        box = Gtk.Box(spacing=18, margin=8)
+        frame.add(box)
         ready = [key for key in ("moge3", "original") if self.engines[key]["ready"]]
         if not ready:
             hints = "\n".join(f"{self.engines[k]['label']}：{self.engines[k]['hint']}" for k in self.engines)
-            return css_label("系統尚未安裝完成，請聯絡工程人員。\n" + hints, "warn", wrap=True)
-        if len(ready) == 1:  # a single installed engine needs no choice
-            return Gtk.Box()
-        frame = Gtk.Frame(label=" 建圖方式 ")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin=8)
-        frame.add(box)
+            box.pack_start(css_label("系統尚未安裝完成，請聯絡工程人員。\n" + hints, "warn", wrap=True), False, False, 0)
+            return frame
+        if len(ready) == 1:
+            box.pack_start(css_label(self.engines[ready[0]]["label"], "hint"), False, False, 0)
+            return frame
         group = None
-        for key in ready:
+        for key in ("moge3", "original"):
+            if key not in ready:
+                continue
             radio = Gtk.RadioButton.new_with_label_from_widget(group, self.engines[key]["label"])
-            group = group or radio
+            radio.set_tooltip_text(self.engines[key]["label"])
+            if group is None:
+                group = radio
             radio.set_active(key == self.engine)
             radio.connect("toggled", self.on_engine_toggled, key)
-            self.radios.setdefault(key, []).append(radio)
+            self.radios[key] = radio
             box.pack_start(radio, False, False, 0)
+        self.engine_hint = css_label("", "hint")
+        box.pack_start(self.engine_hint, False, False, 0)
         return frame
 
-    radios: dict = {}
+    def _step_frame(self, title_label: Gtk.Label, *children: Gtk.Widget) -> Gtk.Frame:
+        frame = Gtk.Frame()
+        frame.set_label_widget(title_label)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+        frame.add(box)
+        for child in children:
+            box.pack_start(child, False, False, 0)
+        return frame
 
     def _map_page(self) -> Gtk.Widget:
-        self.radios = {}
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=12)
-        page.pack_start(self.engine_box(), False, False, 0)
-        page.pack_start(css_label("① 加入影片", "step"), False, False, 4)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        # --- step 1: videos ---
+        self.map_step1 = css_label("步驟 1／3：加入影片", "step")
+        video_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.video_store = Gtk.ListStore(str)
         self.video_view = Gtk.TreeView(model=self.video_store, headers_visible=False)
+        self.video_view.set_tooltip_text("已加入的影片或資料夾。按住 Ctrl 可多選，再按「移除選取」。")
         self.video_view.append_column(Gtk.TreeViewColumn("影片", Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE), text=0))
         self.video_view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
         scroll.set_size_request(-1, 130)
         scroll.add(self.video_view)
-        page.pack_start(scroll, False, False, 0)
-        buttons = Gtk.Box(spacing=6)
-        for text, handler in (("加入資料夾…", self.add_folder), ("加入影片檔…", self.add_files), ("移除選取", self.remove_videos)):
-            button = Gtk.Button(label=text)
-            button.connect("clicked", handler)
-            buttons.pack_start(button, False, False, 0)
-        page.pack_start(buttons, False, False, 0)
+        video_list.pack_start(scroll, False, False, 0)
+        row1 = Gtk.Box(spacing=6)
+        self.add_folder_button = Gtk.Button(label="加入資料夾…")
+        self.add_folder_button.set_tooltip_text("選一個放滿影片的資料夾（會自動找出裡面的影片檔）")
+        self.add_folder_button.connect("clicked", self.add_folder)
+        self.add_files_button = Gtk.Button(label="加入影片檔…")
+        self.add_files_button.set_tooltip_text("選一部或多部影片檔（可 Ctrl 多選）")
+        self.add_files_button.connect("clicked", self.add_files)
+        row1.pack_start(self.add_folder_button, False, False, 0)
+        row1.pack_start(self.add_files_button, False, False, 0)
+        video_list.pack_start(row1, False, False, 0)
+        row2 = Gtk.Box(spacing=6)
+        remove_button = Gtk.Button(label="移除選取")
+        remove_button.set_tooltip_text("從清單移除反白的項目（不會刪除檔案）")
+        remove_button.connect("clicked", self.remove_videos)
+        clear_button = Gtk.Button(label="清空全部")
+        clear_button.set_tooltip_text("清空整個清單（不會刪除檔案）")
+        clear_button.connect("clicked", lambda _b: self.video_store.clear())
+        row2.pack_start(remove_button, False, False, 0)
+        row2.pack_start(clear_button, False, False, 0)
+        video_list.pack_start(row2, False, False, 0)
         self.video_hint = css_label("", "hint")
-        page.pack_start(self.video_hint, False, False, 0)
+        video_list.pack_start(self.video_hint, False, False, 0)
+        page.pack_start(self._step_frame(self.map_step1, video_list), False, False, 0)
 
-        page.pack_start(css_label("② 設定", "step"), False, False, 4)
-        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
-        page.pack_start(grid, False, False, 0)
+        # --- step 2: settings ---
+        self.map_step2 = css_label("步驟 2／3：取名與輸出位置", "step")
+        settings = Gtk.Grid(column_spacing=8, row_spacing=6)
         self.name = Gtk.Entry(text="site", hexpand=True)
+        self.name.set_tooltip_text("任務名稱：只能用英文、數字、底線；會變成輸出資料夾的名字")
         self.out = Gtk.Entry(text=str(jobs.REPO / "acam_out"), hexpand=True)
+        self.out.set_tooltip_text("建圖結果要放在哪個資料夾")
         self.intrinsics = Gtk.Entry(hexpand=True, placeholder_text="留空使用預設")
-        grid.attach(Gtk.Label(label="任務名稱", xalign=0), 0, 0, 1, 1)
-        grid.attach(self.name, 1, 0, 2, 1)
-        grid.attach(Gtk.Label(label="輸出位置", xalign=0), 0, 1, 1, 1)
-        grid.attach(self.out, 1, 1, 1, 1)
-        grid.attach(self.chooser_button(self.out, "folder"), 2, 1, 1, 1)
-        grid.attach(Gtk.Label(label="相機標定檔", xalign=0), 0, 2, 1, 1)
-        grid.attach(self.intrinsics, 1, 2, 1, 1)
-        grid.attach(self.chooser_button(self.intrinsics, "json"), 2, 2, 1, 1)
-        page.pack_start(css_label("相機標定檔為選填（無畸變 PINHOLE JSON）。沒有的話，MoGe-3 版會自動估計。", "hint", wrap=True), False, False, 0)
-        self.skip_dense = Gtk.CheckButton(label="略過稠密化（較快，不產生稠密點雲；僅 MoGe-3 版）")
-        page.pack_start(self.skip_dense, False, False, 4)
-        page.pack_start(css_label("③ 開始", "step"), False, False, 4)
-        self.start_map_button = Gtk.Button(label="開始建圖")
+        self.intrinsics.set_tooltip_text("相機標定檔（無畸變 PINHOLE JSON）。沒有的話，MoGe-3 版會自動估計；原始版只能用預設相機。")
+        settings.attach(Gtk.Label(label="任務名稱", xalign=0), 0, 0, 1, 1)
+        settings.attach(self.name, 1, 0, 2, 1)
+        settings.attach(Gtk.Label(label="輸出位置", xalign=0), 0, 1, 1, 1)
+        settings.attach(self.out, 1, 1, 1, 1)
+        settings.attach(self.chooser_button(self.out, "folder"), 2, 1, 1, 1)
+        settings.attach(Gtk.Label(label="相機標定檔", xalign=0), 0, 2, 1, 1)
+        settings.attach(self.intrinsics, 1, 2, 1, 1)
+        settings.attach(self.chooser_button(self.intrinsics, "json"), 2, 2, 1, 1)
+        settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        settings_box.pack_start(settings, False, False, 0)
+        self.skip_dense = Gtk.CheckButton(label="略過稠密化（比較快，但不產生稠密點雲；只有 MoGe-3 版有效）")
+        settings_box.pack_start(self.skip_dense, False, False, 0)
+        page.pack_start(self._step_frame(self.map_step2, settings_box), False, False, 0)
+
+        # --- step 3: go ---
+        self.map_step3 = css_label("步驟 3／3：開始", "step")
+        go = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.start_map_button = Gtk.Button(label="▶ 開始建圖")
         self.start_map_button.get_style_context().add_class("go")
+        self.start_map_button.set_tooltip_text("條件都湊齊後才可以按；要花數小時，電腦不要關機")
         self.start_map_button.connect("clicked", self.start_map)
-        page.pack_start(self.start_map_button, False, False, 0)
+        go.pack_start(self.start_map_button, False, False, 0)
+        self.map_readiness = css_label("", "notready")
+        go.pack_start(self.map_readiness, False, False, 0)
+        page.pack_start(self._step_frame(self.map_step3, go), False, False, 0)
         return page
 
     def _cruise_page(self) -> Gtk.Widget:
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=12)
-        page.pack_start(self.engine_box(), False, False, 0)
-        page.pack_start(css_label("① 選擇已建好的地圖", "step"), False, False, 4)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        # --- step 1: map ---
+        self.cruise_step1 = css_label("步驟 1／3：選擇已建好的地圖", "step")
+        map_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.map_pick = Gtk.ComboBoxText()
+        self.map_pick.set_tooltip_text("在這台電腦建好、已完成的建圖任務，直接選就行")
         self.map_pick.connect("changed", self.on_map_pick)
-        page.pack_start(self.map_pick, False, False, 0)
+        map_box.pack_start(self.map_pick, False, False, 0)
         row = Gtk.Box(spacing=6)
-        self.map_dir = Gtk.Entry(hexpand=True, placeholder_text="或選擇其他地圖資料夾")
+        self.map_dir = Gtk.Entry(hexpand=True, placeholder_text="或選擇其他地圖資料夾…")
+        self.map_dir.set_tooltip_text("也可以手動選：MoGe-3 版選含 localization/bundle 的資料夾；原始版選含 run/ 的資料夾")
         row.pack_start(self.map_dir, True, True, 0)
         row.pack_start(self.chooser_button(self.map_dir, "folder"), False, False, 0)
-        page.pack_start(row, False, False, 0)
-        page.pack_start(css_label("MoGe-3 版：選含 localization/bundle 的資料夾；原始版：選含 run/ 的資料夾", "hint", wrap=True), False, False, 0)
-        page.pack_start(css_label("② 選擇巡航影片", "step"), False, False, 4)
+        map_box.pack_start(row, False, False, 0)
+        self.map_pick_hint = css_label("", "hint", wrap=True)
+        map_box.pack_start(self.map_pick_hint, False, False, 0)
+        page.pack_start(self._step_frame(self.cruise_step1, map_box), False, False, 0)
+
+        # --- step 2: query video ---
+        self.cruise_step2 = css_label("步驟 2／3：選擇巡航影片", "step")
+        query_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         row = Gtk.Box(spacing=6)
-        self.query = Gtk.Entry(hexpand=True)
+        self.query = Gtk.Entry(hexpand=True, placeholder_text="點右邊「選擇…」挑一部影片")
+        self.query.set_tooltip_text("想定位哪一部飛行影片，就選哪一部")
         row.pack_start(self.query, True, True, 0)
         row.pack_start(self.chooser_button(self.query, "video"), False, False, 0)
-        page.pack_start(row, False, False, 0)
-        page.pack_start(css_label("③ 航線名稱（選填）", "step"), False, False, 4)
-        self.route = Gtk.Entry(placeholder_text="留空則用影片檔名")
-        page.pack_start(self.route, False, False, 0)
-        page.pack_start(css_label("④ 開始", "step"), False, False, 4)
-        self.start_cruise_button = Gtk.Button(label="開始巡航定位")
+        query_box.pack_start(row, False, False, 0)
+        page.pack_start(self._step_frame(self.cruise_step2, query_box), False, False, 0)
+
+        # --- step 3: go ---
+        self.cruise_step3 = css_label("步驟 3／3：開始", "step")
+        go = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.route = Gtk.Entry(placeholder_text="航線名稱（選填，留空就用影片檔名）")
+        self.route.set_tooltip_text("給這次巡航取個名字，結果會放在以它命名的資料夾")
+        go.pack_start(self.route, False, False, 0)
+        self.start_cruise_button = Gtk.Button(label="▶ 開始巡航定位")
         self.start_cruise_button.get_style_context().add_class("go")
         self.start_cruise_button.connect("clicked", self.start_cruise)
-        page.pack_start(self.start_cruise_button, False, False, 0)
+        go.pack_start(self.start_cruise_button, False, False, 0)
+        self.cruise_readiness = css_label("", "notready")
+        go.pack_start(self.cruise_readiness, False, False, 0)
+        page.pack_start(self._step_frame(self.cruise_step3, go), False, False, 0)
         return page
 
     def _right(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=8)
-        box.pack_start(css_label("任務列表", "step"), False, False, 0)
+        box.pack_start(css_label("任務列表（點一下看詳情）", "step"), False, False, 0)
         self.job_store = Gtk.ListStore(str, str, str, str, str, str, str)  # id, kind, name, engine, status, time, status colour
         self.job_view = Gtk.TreeView(model=self.job_store)
         for index, (title, width) in enumerate((("類型", 70), ("名稱", 230), ("方式", 80), ("狀態", 90), ("時間", 150)), start=1):
@@ -273,56 +350,69 @@ class App(Gtk.Window):
 
         top = Gtk.Box(spacing=8)
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.title_label = Gtk.Label(label="尚未選擇任務", xalign=0)
+        self.title_label = Gtk.Label(label="還沒選任務：在左邊開始一個，或點上面的任務列表", xalign=0)
         self.title_label.get_style_context().add_class("step")
         self.status_label = Gtk.Label(xalign=0, use_markup=True)
+        self.elapsed_label = css_label("", "hint")
         self.path_label = css_label("", "hint")
         self.path_label.set_selectable(True)
         self.path_label.set_line_wrap(True)
-        for widget in (self.title_label, self.status_label, self.path_label):
+        for widget in (self.title_label, self.status_label, self.elapsed_label, self.path_label):
             info.pack_start(widget, False, False, 0)
         top.pack_start(info, True, True, 0)
-        self.stop_button = Gtk.Button(label="停止")
+        self.stop_button = Gtk.Button(label="■ 停止")
+        self.stop_button.set_tooltip_text("中斷這個任務（會先問你確認）")
         self.stop_button.set_sensitive(False)
-        self.stop_button.connect("clicked", lambda _b: self.selected and jobs.stop_job(self.selected))
+        self.stop_button.connect("clicked", self.confirm_stop)
         self.open_button = Gtk.Button(label="開啟資料夾")
+        self.open_button.set_tooltip_text("用檔案總管打開結果資料夾")
         self.open_button.set_sensitive(False)
         self.open_button.connect("clicked", self.open_folder)
         top.pack_end(self.open_button, False, False, 0)
         top.pack_end(self.stop_button, False, False, 0)
         box.pack_start(top, False, False, 4)
 
-        box.pack_start(css_label("結果", "step"), False, False, 0)
+        box.pack_start(css_label("結果（完成後出現在這裡，檔名點兩下可直接開啟）", "step"), False, False, 0)
         self.result_stack = Gtk.Stack()
         self.result_hint = css_label("任務完成後顯示結果", "hint")
         self.result_stack.add_named(self.result_hint, "hint")
         self.file_store = Gtk.ListStore(str, str, str)
         files = Gtk.TreeView(model=self.file_store)
+        files.set_tooltip_text("點兩下開啟檔案或資料夾")
         for index, (title, width) in enumerate((("項目", 190), ("路徑", 420), ("大小", 80))):
             renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
             column = Gtk.TreeViewColumn(title, renderer, text=index)
             column.set_min_width(width)
             column.set_resizable(True)
             files.append_column(column)
+        files.connect("row-activated", self.open_result_row)
         file_scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
         file_scroll.add(files)
         self.result_stack.add_named(file_scroll, "files")
         cruise = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.cruise_summary = Gtk.Label(xalign=0)
+        self.coverage_bar = Gtk.ProgressBar(show_text=True)
         self.plot_image = Gtk.Image()
         self.plot_holder = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
         self.plot_holder.add(self.plot_image)
         self.plot_holder.connect("size-allocate", lambda _w, _a: self.redraw_plot())
         self.legend = Gtk.Label(xalign=0, use_markup=True)
         cruise.pack_start(self.cruise_summary, False, False, 0)
+        cruise.pack_start(self.coverage_bar, False, False, 0)
         cruise.pack_start(self.plot_holder, True, True, 0)
         cruise.pack_start(self.legend, False, False, 0)
         self.result_stack.add_named(cruise, "cruise")
         self.result_stack.set_size_request(-1, 300)
         box.pack_start(self.result_stack, False, False, 0)
 
-        box.pack_start(css_label("執行日誌", "step"), False, False, 0)
-        self.log = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.CHAR)
+        log_head = Gtk.Box(spacing=8)
+        log_head.pack_start(css_label("執行日誌（卡住時把這段文字給工程人員看）", "step"), True, True, 0)
+        self.autoscroll_check = Gtk.CheckButton(label="自動捲到最新")
+        self.autoscroll_check.set_active(True)
+        self.autoscroll_check.connect("toggled", lambda b: setattr(self, "autoscroll", b.get_active()))
+        log_head.pack_start(self.autoscroll_check, False, False, 0)
+        box.pack_start(log_head, False, False, 0)
+        self.log = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.log.get_style_context().add_class("log")
         log_scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
         log_scroll.add(self.log)
@@ -386,6 +476,8 @@ class App(Gtk.Window):
 
     def remove_videos(self, _button=None) -> None:
         model, paths = self.video_view.get_selection().get_selected_rows()
+        if not paths:
+            return
         for ref in [Gtk.TreeRowReference.new(model, p) for p in paths]:
             model.remove(model.get_iter(ref.get_path()))
 
@@ -395,14 +487,20 @@ class App(Gtk.Window):
             self.on_engine_changed()
 
     def on_engine_changed(self) -> None:
-        for key, widgets in self.radios.items():
-            for radio in widgets:
-                if radio.get_active() != (key == self.engine):
-                    radio.set_active(key == self.engine)
+        for key, radio in self.radios.items():
+            if radio.get_active() != (key == self.engine):
+                radio.set_active(key == self.engine)
         original = self.engine == "original"
-        self.video_hint.set_text("原始版：只能加入一個影片資料夾" if original else "可加入多個資料夾或影片檔")
+        if hasattr(self, "engine_hint"):
+            self.engine_hint.set_text("原始版：建圖一次只吃一個資料夾；巡航要另外給查詢影片" if original
+                                      else "MoGe-3 版：可一次加入多個資料夾或影片檔")
+        # 原始版建圖只吃資料夾：與其等按下去才報錯，不如直接不讓你選檔案
+        self.add_files_button.set_sensitive(not original)
+        self.video_hint.set_text("原始版：只能加入「一個」影片資料夾，多選檔案沒用" if original else "可加入多個資料夾或影片檔，會自動找出裡面的影片")
         self.skip_dense.set_sensitive(not original)
+        self.map_pick_hint.set_text("原始版：選含 run/ 的資料夾" if original else "MoGe-3 版：選含 localization/bundle 的資料夾")
         self.refresh_map_choices(force=True)
+        self.update_readiness()
 
     def on_map_pick(self, combo: Gtk.ComboBoxText) -> None:
         path = self.cruise_maps.get(combo.get_active_text() or "")
@@ -417,6 +515,40 @@ class App(Gtk.Window):
             self.map_pick.remove_all()
             for label in mapping:
                 self.map_pick.append_text(label)
+            if mapping and not self.map_dir.get_text().strip():
+                first = next(iter(mapping.values()))
+                self.map_dir.set_text(first)
+
+    # ------------------------------------------------------------------------------------------ readiness
+    def map_request(self) -> dict:
+        return {"kind": "map", "engine": self.engine, "name": self.name.get_text(),
+                "videos": [row[0] for row in self.video_store], "out": self.out.get_text(),
+                "intrinsics": self.intrinsics.get_text(), "skip_dense": self.skip_dense.get_active()}
+
+    def cruise_request(self) -> dict:
+        return {"kind": "cruise", "engine": self.engine, "map": self.map_dir.get_text(),
+                "video": self.query.get_text(), "route": self.route.get_text()}
+
+    def _show_readiness(self, label: Gtk.Label, ready: bool, message: str, button: Gtk.Button) -> None:
+        label.set_text(("✓ " if ready else "○ ") + message)
+        label.get_style_context().remove_class("ready")
+        label.get_style_context().remove_class("notready")
+        label.get_style_context().add_class("ready" if ready else "notready")
+        button.set_sensitive(ready)
+
+    def update_readiness(self) -> None:
+        """Enable the start buttons only when the form is actually submittable."""
+        if not hasattr(self, "start_map_button"):
+            return
+        videos = [row[0] for row in self.video_store]
+        self.map_step1.set_text(f"步驟 1／3：加入影片（已選 {len(videos)} 項）")
+        self.map_step1.get_style_context().remove_class("step-done")
+        self.map_step1.get_style_context().remove_class("step")
+        self.map_step1.get_style_context().add_class("step-done" if videos else "step")
+        ready, message = jobs.validate_map_request(self.map_request())
+        self._show_readiness(self.map_readiness, ready, message, self.start_map_button)
+        ready, message = jobs.validate_cruise_request(self.cruise_request())
+        self._show_readiness(self.cruise_readiness, ready, message, self.start_cruise_button)
 
     # ------------------------------------------------------------------------------------------ actions
     def error(self, message: str) -> None:
@@ -436,18 +568,42 @@ class App(Gtk.Window):
         self.select(job["id"])
 
     def start_map(self, _button=None) -> None:
-        self.submit({"kind": "map", "engine": self.engine, "name": self.name.get_text(), "videos": [row[0] for row in self.video_store],
-                     "out": self.out.get_text(), "intrinsics": self.intrinsics.get_text(), "skip_dense": self.skip_dense.get_active()})
+        self.submit(self.map_request())
 
     def start_cruise(self, _button=None) -> None:
-        self.submit({"kind": "cruise", "engine": self.engine, "map": self.map_dir.get_text(), "video": self.query.get_text(),
-                     "route": self.route.get_text()})
+        self.submit(self.cruise_request())
+
+    def confirm_stop(self, _button=None) -> None:
+        if not self.selected:
+            return
+        try:
+            job = jobs.read_job(self.selected)
+        except (OSError, ValueError):
+            return
+        if job.get("status") != "running":
+            return
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.YES_NO,
+                                   text=f"確定要停止「{job.get('name', '')}」嗎？\n停掉後這次執行的進度就沒了。")
+        answer = dialog.run()
+        dialog.destroy()
+        if answer == Gtk.ResponseType.YES:
+            jobs.stop_job(self.selected)
 
     def open_folder(self, _button=None) -> None:
         if self.selected:
-            folder = jobs.read_job(self.selected).get("result_dir")
+            try:
+                folder = jobs.read_job(self.selected).get("result_dir")
+            except (OSError, ValueError):
+                return
             if folder and Path(folder).exists():
                 subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def open_result_row(self, view: Gtk.TreeView, path: Gtk.TreePath, _column) -> None:
+        row = self.file_store[path]
+        target = row[1]
+        if target and Path(target).exists():
+            subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def on_close(self, *_args) -> bool:
         if jobs.running_count():
@@ -479,6 +635,7 @@ class App(Gtk.Window):
             self.select(model[tree_iter][0])
 
     def tick(self) -> bool:
+        self.update_readiness()
         listing = jobs.list_jobs()
         signature = tuple((j["id"], j["status"]) for j in listing)
         if signature != self.signature:
@@ -503,18 +660,22 @@ class App(Gtk.Window):
         extra += f"　{GLib.markup_escape_text(job['error'])}" if job.get("error") else ""
         self.status_label.set_markup(f'<span foreground="{STATUS_COLOR.get(job["status"], "#24292f")}" weight="bold">'
                                      f'{STATUS.get(job["status"], job["status"])}</span>　方式 {job["engine"]}{extra}')
+        start = job.get("created", time.time())
+        end = job.get("finished", time.time()) if job["status"] in FINAL else time.time()
+        verb = "耗時" if job["status"] in FINAL else "已執行"
+        self.elapsed_label.set_text(f"{verb} {format_duration(end - start)}"
+                                    + ("　（執行中：看下方日誌確認還活著）" if job["status"] == "running" else ""))
         self.path_label.set_text(job.get("result_dir", ""))
         self.stop_button.set_sensitive(job["status"] == "running")
         self.open_button.set_sensitive(Path(job.get("result_dir", "")).exists())
         chunk, self.log_offset = jobs.read_log(job["id"], self.log_offset)
         if chunk:
-            adjustment = self.log_scroll.get_vadjustment()
-            at_bottom = adjustment.get_value() >= adjustment.get_upper() - adjustment.get_page_size() - 30
             buffer = self.log.get_buffer()
             buffer.insert(buffer.get_end_iter(), chunk.replace("\r", "\n"))
             if buffer.get_line_count() > 4000:
                 buffer.delete(buffer.get_start_iter(), buffer.get_iter_at_line(buffer.get_line_count() - 3000))
-            if at_bottom:
+            if self.autoscroll:
+                adjustment = self.log_scroll.get_vadjustment()
                 GLib.idle_add(lambda: adjustment.set_value(adjustment.get_upper()) and False)
         if job["status"] in FINAL and self.shown != (job["id"], job["status"]):
             self.shown = (job["id"], job["status"])
@@ -534,17 +695,25 @@ class App(Gtk.Window):
             if rows:
                 self.result_stack.set_visible_child_name("files")
             else:
-                self.result_hint.set_text("尚無產出檔案")
+                hint = ("建圖失敗：看上方日誌找原因，修好後再跑一次" if job["status"] == "failed"
+                        else "任務被停止或中斷：沒有產出檔案" if job["status"] in ("stopped", "interrupted")
+                        else "尚無產出檔案")
+                self.result_hint.set_text(hint)
                 self.result_stack.set_visible_child_name("hint")
             return
         data = jobs.cruise_result(job)
         if data is None:
-            self.result_hint.set_text("尚無定位結果")
+            hint = ("巡航失敗：看上方日誌找原因" if job["status"] == "failed"
+                    else "任務被停止或中斷：沒有定位結果" if job["status"] in ("stopped", "interrupted")
+                    else "尚無定位結果")
+            self.result_hint.set_text(hint)
             self.result_stack.set_visible_child_name("hint")
             return
         counts = "　".join(f"{POSE_NAME.get(k, k)} {v}" for k, v in data["status_counts"].items())
-        coverage = f"{data['coverage'] * 100:.1f}%" if data["coverage"] is not None else "—"
-        self.cruise_summary.set_text(f"影格數 {data['frames']}　位姿覆蓋率 {coverage}\n{counts}")
+        coverage = data["coverage"] if data["coverage"] is not None else 0.0
+        self.cruise_summary.set_text(f"影格數 {data['frames']}　位姿覆蓋率 {coverage * 100:.1f}%\n{counts}")
+        self.coverage_bar.set_fraction(max(0.0, min(1.0, coverage)))
+        self.coverage_bar.set_text(f"覆蓋率 {coverage * 100:.1f}%")
         self.legend.set_markup("　".join(
             f'<span foreground="#{r:02x}{g:02x}{b:02x}">●</span> {POSE_NAME[k]}' for k, (r, g, b) in POSE_COLOR.items())
             + "　　航跡俯視圖（地圖座標 X–Z，非公尺）")

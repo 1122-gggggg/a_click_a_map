@@ -115,6 +115,51 @@ def expand_videos(entries: list[str]) -> list[Path]:
     return list(unique.values())
 
 
+def validate_map_request(request: dict) -> tuple[bool, str]:
+    """Lightweight pre-flight check for the 建圖 form: (ready, reason).
+
+    Cheap (a few stat calls, no decoding); the GUI calls this on every tick to
+    enable/disable the start button. `build_map_command` enforces the same rules.
+    """
+    engine = request.get("engine")
+    entries = [e.strip() for e in request.get("videos", []) if e.strip()]
+    if not entries:
+        return False, "還沒加入影片：先按「加入資料夾」或「加入影片檔」"
+    if not (request.get("name") or "").strip():
+        return False, "任務名稱不能空白"
+    if not (request.get("out") or "").strip():
+        return False, "輸出位置不能空白"
+    intrinsics = (request.get("intrinsics") or "").strip()
+    if intrinsics and not Path(intrinsics).expanduser().is_file():
+        return False, f"找不到標定檔：{intrinsics}"
+    if engine == "original":
+        if len(entries) != 1 or not Path(entries[0]).expanduser().is_dir():
+            return False, "原始版一次只吃「一個影片資料夾」：請只留一個資料夾"
+        return True, "就緒：按「開始建圖」"
+    if engine == "moge3":
+        try:
+            count = sum(1 for _ in expand_videos(entries))
+        except ValueError as error:
+            return False, str(error)
+        return True, f"就緒：共 {count} 部影片，按「開始建圖」"
+    return False, "未知的建圖方式"
+
+
+def validate_cruise_request(request: dict) -> tuple[bool, str]:
+    """Lightweight pre-flight check for the 巡航定位 form: (ready, reason)."""
+    engine = request.get("engine")
+    if engine not in ("original", "moge3"):
+        return False, "未知的建圖方式"
+    if not request.get("video", "").strip():
+        return False, "還沒選擇巡航影片"
+    if not Path(request.get("video", "")).expanduser().is_file():
+        return False, f"找不到巡航影片：{request.get('video', '')}"
+    if not request.get("map", "").strip():
+        return False, "還沒選擇已建好的地圖"
+    if not Path(request.get("map") or "").expanduser().is_dir():
+        return False, f"找不到地圖資料夾：{request.get('map', '')}"
+    return True, "就緒：按「開始巡航定位」"
+
 def build_map_command(request: dict) -> tuple[list[str], dict]:
     engine = request["engine"]
     entries = [e.strip() for e in request.get("videos", []) if e.strip()]
