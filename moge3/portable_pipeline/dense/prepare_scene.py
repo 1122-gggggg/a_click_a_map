@@ -187,9 +187,12 @@ def main():
         obs_row_parts.append(rows)
         obs_img_parts.append(np.full(rows.size, i, np.int32))
         seg[i + 1] = seg[i] + rows.size
-        if i in sample_idx:
+        if i in sample_idx and rows.size:
+            # Images with no valid 3D observations (e.g. pose-only frames)
+            # carry an empty xy array that would break the reprojection check.
             xy = np.array([q.xy for q in p2], dtype=np.float64)[ok]
-            verify_obs[i] = (rows.copy(), xy)
+            if xy.ndim == 2 and xy.shape[0] > 0:
+                verify_obs[i] = (rows.copy(), xy)
         if i % 256 == 0:
             log(f"observations: image {i}/{N}")
     obs_row = np.concatenate(obs_row_parts)
@@ -371,10 +374,17 @@ def main():
         reproj.append(r)
         if np.any(Xc[:, 2] <= 0):
             raise SystemExit(f"non-positive depth for observed point in sample image {i}")
+    if not reproj:
+        log("WARNING: no sampled image had valid 3D observations; skipping reprojection check")
+        reproj = [np.zeros(0)]
     reproj = np.concatenate(reproj)
-    reproj_stats = dict(sampled_images=len(verify_obs), observations=int(reproj.size),
-                        mean_px=float(reproj.mean()), median_px=float(np.median(reproj)),
-                        p99_px=float(np.percentile(reproj, 99)), max_px=float(reproj.max()))
+    if reproj.size:
+        reproj_stats = dict(sampled_images=len(verify_obs), observations=int(reproj.size),
+                            mean_px=float(reproj.mean()), median_px=float(np.median(reproj)),
+                            p99_px=float(np.percentile(reproj, 99)), max_px=float(reproj.max()))
+    else:
+        reproj_stats = dict(sampled_images=len(verify_obs), observations=0,
+                            mean_px=0.0, median_px=0.0, p99_px=0.0, max_px=0.0)
 
     in_range = []
     for i in range(N):
