@@ -597,11 +597,16 @@ class App(Gtk.Window):
         self.stop_button.set_tooltip_text("中斷這個任務（會先問你確認）")
         self.stop_button.set_sensitive(False)
         self.stop_button.connect("clicked", self.confirm_stop)
+        self.resume_button = Gtk.Button(label="↻ 續跑")
+        self.resume_button.set_tooltip_text("用同樣的設定再跑一次；建圖會從已完成的階段接續，不會重做")
+        self.resume_button.set_sensitive(False)
+        self.resume_button.connect("clicked", self.resume_selected)
         self.open_button = Gtk.Button(label="開啟資料夾")
         self.open_button.set_tooltip_text("用檔案總管打開結果資料夾")
         self.open_button.set_sensitive(False)
         self.open_button.connect("clicked", self.open_folder)
         top.pack_end(self.open_button, False, False, 0)
+        top.pack_end(self.resume_button, False, False, 0)
         top.pack_end(self.stop_button, False, False, 0)
         box.pack_start(top, False, False, 4)
 
@@ -836,6 +841,17 @@ class App(Gtk.Window):
     def start_cruise(self, _button=None) -> None:
         self.submit(self.cruise_request())
 
+    def resume_selected(self, _button=None) -> None:
+        if not self.selected:
+            return
+        try:
+            job = jobs.read_job(self.selected)
+        except (OSError, ValueError):
+            return
+        if job.get("status") not in ("failed", "stopped", "interrupted"):
+            return
+        self.submit(jobs.resume_request(job))
+
     def confirm_stop(self, _button=None) -> None:
         if not self.selected:
             return
@@ -993,6 +1009,7 @@ class App(Gtk.Window):
         self.path_label.set_text(job.get("result_dir", ""))
         self.update_stage(job)
         self.stop_button.set_sensitive(job["status"] == "running")
+        self.resume_button.set_sensitive(job["status"] in ("failed", "stopped", "interrupted"))
         self.open_button.set_sensitive(Path(job.get("result_dir", "")).exists())
         chunk, self.log_offset = jobs.read_log(job["id"], self.log_offset)
         if chunk:

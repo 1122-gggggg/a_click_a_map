@@ -412,6 +412,16 @@ def build_cruise_command(request: dict, job_id: str) -> tuple[list[str] | str, d
     )
     return script, meta
 
+def resume_request(job: dict) -> dict:
+    """Rebuild the submit request from a finished job so it reruns with the same settings.
+
+    Map reruns reuse the same out/name, so the engine resumes from finished
+    stage caches instead of redoing them. Cruise reruns are quick anyway.
+    """
+    request = dict(job.get("request", {}))
+    request.update(kind=job.get("kind"), engine=job.get("engine"))
+    return request
+
 
 # ------------------------------------------------------------------------------------------------ running
 def _run(job: dict, cmd: list[str] | str) -> None:

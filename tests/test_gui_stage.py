@@ -114,3 +114,11 @@ def test_parse_progress_empty_and_done() -> None:
     assert jobs.parse_progress("starting...\n")["percent"] is None
     info = jobs.parse_progress("[0/4] x\n[1/4] y\n[2/4] z\n[3/4] r\n[4/4] p\ndone\n")
     assert info["stage"] == 4
+
+
+def test_resume_request_rebuilds_submit() -> None:
+    job = {"kind": "map", "engine": "original",
+           "request": {"videos": ["a"], "out": "o", "name": "n", "irrelevant": 1}}
+    req = jobs.resume_request(job)
+    assert req["kind"] == "map" and req["engine"] == "original"
+    assert req["videos"] == ["a"] and req["name"] == "n"
