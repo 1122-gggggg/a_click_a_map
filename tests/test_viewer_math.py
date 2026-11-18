@@ -126,3 +126,37 @@ def test_wheel_zoom_anchors_cursor() -> None:
     assert ok2[idx]
     assert abs(float(sx2[idx]) - ex) <= 1 and abs(float(sy2[idx]) - ey) <= 1
     assert viewer.on_scroll(None, _FakeEvent(left, ex, ey)) is False
+
+
+class _FakeGesture:
+    _ids = iter(range(1000000, 2000000))
+
+    def __init__(self) -> None:
+        self._id = next(_FakeGesture._ids)
+
+    def __hash__(self) -> int:
+        return self._id
+
+
+def _viewer_with_gestures(n: int = 1000, seed: int = 3):
+    viewer, consts = _viewer_with_points(n, seed)
+    viewer._drag_last = {}
+    return viewer, consts
+
+
+def test_drag_never_gets_stuck() -> None:
+    viewer, _consts = _viewer_with_gestures()
+    gesture = _FakeGesture()
+    viewer.on_drag_begin(gesture, 0.0, 0.0)
+    x = 0.0
+    for _ in range(40):  # several full turns: must keep accumulating
+        x += 100.0
+        viewer.on_drag_update(gesture, x, 0.0, False)
+    assert viewer.yaw > 0.008 * 3900, viewer.yaw
+    y = 0.0
+    for _ in range(40):  # straight over the top: must wrap, never pin
+        y += 100.0
+        viewer.on_drag_update(gesture, 0.0, y, False)
+    assert -np.pi <= viewer.pitch <= np.pi
+    viewer.on_drag_end(gesture, 0.0, 0.0)
+    assert id(gesture) not in viewer._drag_last

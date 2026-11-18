@@ -160,15 +160,23 @@ class MapViewer:
             self.image.set_size_request(-1, VIEWER_HEIGHT)
         self.box = Gtk.EventBox()
         self.box.add(self.image)
-        self.box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
-                            | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
+        self.box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.SCROLL_MASK)
         self.box.connect("button-press-event", self.on_press)
-        self.box.connect("button-release-event", self.on_release)
-        self.box.connect("motion-notify-event", self.on_motion)
         self.box.connect("scroll-event", self.on_scroll)
         self.box.connect("size-allocate", self.on_allocate)
-        self.drag_button = 0
-        self.last = (0.0, 0.0)
+        # GtkGestureDrag grabs the pointer, so a long drag keeps working even
+        # when the cursor leaves the view (the old manual handler stalled there).
+        self.rotate_gesture = Gtk.GestureDrag.new(self.box)
+        self.rotate_gesture.set_button(1)
+        self.rotate_gesture.connect("drag-begin", self.on_drag_begin)
+        self.rotate_gesture.connect("drag-update", self.on_drag_update, False)
+        self.rotate_gesture.connect("drag-end", self.on_drag_end)
+        self.pan_gesture = Gtk.GestureDrag.new(self.box)
+        self.pan_gesture.set_button(3)
+        self.pan_gesture.connect("drag-begin", self.on_drag_begin)
+        self.pan_gesture.connect("drag-update", self.on_drag_update, True)
+        self.pan_gesture.connect("drag-end", self.on_drag_end)
+        self._drag_last: dict = {}
         self.on_change = None
 
     def on_allocate(self, _widget, _allocation) -> None:
@@ -260,26 +268,25 @@ class MapViewer:
         if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
             self.recenter(event.x, event.y)
             return True
-        if event.button in (1, 3):
-            self.drag_button = event.button
-            self.last = (event.x, event.y)
-            return True
         return False
 
-    def on_release(self, _w, event) -> bool:
-        if event.button == self.drag_button:
-            self.drag_button = 0
-            return True
-        return False
+    def on_drag_begin(self, gesture, _x: float, _y: float) -> None:
+        self._drag_last[id(gesture)] = (0.0, 0.0)
 
-    def on_motion(self, _w, event) -> bool:
-        if not self.drag_button or not len(self.points):
-            return False
-        dx, dy = event.x - self.last[0], event.y - self.last[1]
-        self.last = (event.x, event.y)
-        if self.drag_button == 1:
+    def on_drag_end(self, gesture, _x: float, _y: float) -> None:
+        self._drag_last.pop(id(gesture), None)
+
+    def on_drag_update(self, gesture, offset_x: float, offset_y: float, pan: bool) -> None:
+        if not len(self.points):
+            return
+        last = self._drag_last.get(id(gesture), (0.0, 0.0))
+        dx, dy = offset_x - last[0], offset_y - last[1]
+        self._drag_last[id(gesture)] = (offset_x, offset_y)
+        if not pan:
             self.yaw += dx * 0.008
-            self.pitch = min(1.5, max(-1.5, self.pitch + dy * 0.008))
+            # Wrap instead of clamping: orbiting over the top flips past the
+            # pole like a trackball instead of getting stuck against a wall.
+            self.pitch = (self.pitch + dy * 0.008 + np.pi) % (2.0 * np.pi) - np.pi
         else:
             rot = self._rotation()
             scale = self.dist / (max(self.height, 200) * 1.3)
@@ -288,7 +295,6 @@ class MapViewer:
         self.render()
         if self.on_change:
             self.on_change()
-        return True
 
     def on_scroll(self, _w, event) -> bool:
         # CloudCompare-style dolly: zoom toward the cursor, not the screen centre.
