@@ -6,7 +6,8 @@ layout described in that repo's `site_profiles/建圖端輸出規格.md`::
     <site>/
       site_profile.json                  (schema_version 2)
       map/map.ply                        (RGB cloud, x y z + red green blue)
-      model/{cameras,images,points3D,rigs,frames}.bin + occupancy.json
+    map/map_dense.ply                  (optional dense display cloud, if the run has one)
+      model/{cameras,images,points3D,rigs,frames}.bin   (exactly these; no extra files)
       keyframes/keyframes.jsonl + keyframes/images/<video>/*.jpg
       localization/direct_bundle.json    (direct-localization-bundle/v1)
       localization/direct_localizer_profile.json (direct-deployment-profile/v1)
@@ -303,12 +304,12 @@ def export_site(run: Path, out: Path, *, site_id: str, display_name: str, releas
     localization = site / "localization"
 
     # --- bulk payload ----------------------------------------------------------
+    # Layout matches the localization side's import contract exactly: model bins
+    # at top-level model/ (occupancy.json is NOT part of it).
     present_bins = [n for n in MODEL_BINS_REQUIRED + MODEL_BINS_OPTIONAL if (model_dir / n).is_file()]
     model_out.mkdir(parents=True)
     for name in present_bins:
         shutil.copy2(model_dir / name, model_out / name)
-    occupancy = {"n_images": reconstruction.num_images(), "n_points3D": reconstruction.num_points3D()}
-    (model_out / "occupancy.json").write_text(json.dumps(occupancy, indent=2) + "\n", encoding="utf-8")
 
     keyframes_out.mkdir(parents=True)
     shutil.copy2(keyframes_manifest_src, keyframes_out / "keyframes.jsonl")
@@ -330,6 +331,12 @@ def export_site(run: Path, out: Path, *, site_id: str, display_name: str, releas
     points_rgb = np.array([p.color for p in reconstruction.points3D.values()], dtype=np.uint8)
     map_ply = site / "map/map.ply"
     write_map_ply(points_xyz, points_rgb, map_ply)
+    # Optional dense display cloud (not consumed by reloc, for the UI only).
+    dense_src = run / "products/map/dense/dense.ply"
+    dense_dst = site / "map/map_dense.ply"
+    has_dense_display = dense_src.is_file()
+    if has_dense_display:
+        shutil.copy2(dense_src, dense_dst)
 
     # --- reference poses + gravity ---------------------------------------------
     reference_poses = {
@@ -358,6 +365,8 @@ def export_site(run: Path, out: Path, *, site_id: str, display_name: str, releas
     files.append(entry("megaloc_references_sideview.npy", bank_descriptors))
     files.append(entry("megaloc_references_sideview.names.json", bank_names_path))
     files.append(entry("../keyframes/keyframes.jsonl", keyframes_out / "keyframes.jsonl"))
+    if has_dense_display:
+        files.append(entry("../map/map_dense.ply", dense_dst))
     bundle = {
         "schema": "direct-localization-bundle/v1",
         "map_revision_id": release_id,

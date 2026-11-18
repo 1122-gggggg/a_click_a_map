@@ -144,3 +144,29 @@ def test_export_site_validates_against_localization_repo(tmp_path: Path) -> None
     assert len(assets.ref_names) == 150
     assert assets.reference_depth_dir is None and assets.intersection_cells is None
     assert assets.ref_centers is not None and assets.ref_yaws is not None
+
+
+def test_export_matches_delivery_tree_with_optional_dense(tmp_path: Path) -> None:
+    run = _synthetic_run(tmp_path, n_images=120, n_points=100)
+    site = export.export_site(run, tmp_path / "s1", site_id="treecheck",
+                              display_name="Tree", release_id="treecheck_20261118")
+    import json as _json
+    top = {p.name for p in site.iterdir()}
+    assert top == {"site_profile.json", "map", "model", "keyframes", "localization"}, top
+    assert {p.name for p in (site / "map").iterdir()} == {"map.ply"}
+    assert {p.name for p in (site / "model").iterdir()} == {"cameras.bin", "images.bin", "points3D.bin"}
+    assert {p.name for p in (site / "keyframes").iterdir()} == {"keyframes.jsonl", "images"}
+    loc_names = {p.name for p in (site / "localization").iterdir()}
+    assert {"direct_bundle.json", "direct_localizer_profile.json", "reference_poses.json",
+            "T_align_gravity.json", "reference_manifest.jsonl",
+            "megaloc_references_sideview.npy", "megaloc_references_sideview.names.json"} <= loc_names
+    assert "map_dense.ply" not in loc_names and "map_dense.ply" not in {p.name for p in (site / "map").iterdir()}
+    # with dense output present, it ships as map/map_dense.ply and is files[]-listed
+    dense_src = run / "products/map/dense/dense.ply"
+    dense_src.parent.mkdir(parents=True, exist_ok=True)
+    dense_src.write_bytes(b"0123456789ABCDEF")
+    site2 = export.export_site(run, tmp_path / "s2", site_id="treecheck",
+                               display_name="Tree", release_id="treecheck_20261118")
+    assert (site2 / "map/map_dense.ply").is_file()
+    bundle = _json.loads((site2 / "localization/direct_bundle.json").read_text(encoding="utf-8"))
+    assert "../map/map_dense.ply" in [e["path"] for e in bundle["files"]]
