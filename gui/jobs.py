@@ -8,6 +8,7 @@ Engines:
 from __future__ import annotations
 
 import json
+import numpy as np
 import re
 import os
 import sys
@@ -25,6 +26,59 @@ JOBS = REPO / "acam_gui" / "jobs"
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mts"}
 LOCK = threading.Lock()
 PROCS: dict[str, subprocess.Popen] = {}
+VIEWER_MAX_POINTS = 60000
+
+
+def read_ply_points(path: Path) -> tuple:
+    """Read an RGB point cloud PLY (ascii or binary_little_endian) as (xyz, rgb, total)."""
+    with open(path, "rb") as stream:
+        header = []
+        while True:
+            line = stream.readline().decode("ascii", errors="replace").strip()
+            header.append(line)
+            if line == "end_header":
+                break
+            if len(header) > 200:
+                raise ValueError("PLY header too long")
+    count, props, current = 0, [], None
+    for line in header:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "format":
+            pass
+        elif parts[0] == "element":
+            current = parts[1]
+            if current == "vertex":
+                count, props = int(parts[2]), []
+        elif parts[0] == "property" and current == "vertex":
+            props.append((parts[1], parts[2]))
+    if count <= 0 or not props:
+        raise ValueError("PLY has no vertices")
+    names = [name for _, name in props]
+    if "x" not in names or "y" not in names or "z" not in names:
+        raise ValueError("PLY vertices lack x/y/z")
+    rgb_names = ("red", "green", "blue") if "red" in names else (("r", "g", "b") if "r" in names else ())
+    kind_to_dtype = {"char": "i1", "uchar": "u1", "short": "i2", "ushort": "u2",
+                     "int": "i4", "uint": "u4", "float": "f4", "double": "f8"}
+    is_ascii = "format ascii 1.0" in header
+    if not is_ascii:
+        dtype = [(name, kind_to_dtype[kind]) for kind, name in props]
+        with open(path, "rb") as stream:
+            offset = sum(len((line + "\n").encode("ascii", errors="replace")) for line in header)
+            raw = np.fromfile(stream, dtype=dtype, count=count, offset=offset)
+        xyz = np.column_stack([raw["x"].astype(np.float64), raw["y"].astype(np.float64),
+                               raw["z"].astype(np.float64)])
+        rgb = (np.column_stack([np.asarray(raw[n]).astype(np.uint8) for n in rgb_names])
+               if rgb_names else np.full_like(xyz, 160, dtype=np.uint8))
+    else:
+        rows = np.genfromtxt(str(path), dtype=[(n, kind_to_dtype[k]) for k, n in props],
+                             skip_header=len(header), max_rows=count)
+        xyz = np.column_stack([rows["x"].astype(np.float64), rows["y"].astype(np.float64),
+                               rows["z"].astype(np.float64)])
+        rgb = (np.column_stack([np.asarray(rows[n]).astype(np.uint8) for n in rgb_names])
+               if rgb_names else np.full_like(xyz, 160, dtype=np.uint8))
+    return xyz, rgb, count
 
 
 GUI_LOCK = JOBS.parent / "gui.lock"

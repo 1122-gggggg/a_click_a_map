@@ -18,7 +18,7 @@ from .report import to_markdown
 from .videos import aspect_mismatches, find_videos, probe
 
 DEFAULT_INTRINSICS = REPO / "configs/river_intrinsics_undistorted.json"
-COMMANDS = {"map", "doctor", "pack", "localize", "setup"}
+COMMANDS = {"map", "doctor", "pack", "localize", "setup", "export-site"}
 MIN_AVAILABLE_GIB = 10
 
 
@@ -287,6 +287,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return subprocess.run(["bash", str(script), *args.rest]).returncode
 
 
+def cmd_export_site(args: argparse.Namespace) -> int:
+    from .export_site import export_site
+    import datetime
+    release = args.release_id or f"{args.site_id}_{datetime.date.today():%Y%m%d}"
+    try:
+        site = export_site(args.run, args.out, site_id=args.site_id,
+                           display_name=args.display_name or args.site_id, release_id=release)
+    except (ValueError, OSError) as error:
+        say(f"export-site failed: {error}")
+        return 3
+    say(str(site))
+
+
 # --------------------------------------------------------------------------- argparse
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="acam", description=__doc__)
@@ -322,6 +335,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--out", type=Path, default=Path("localize_out"))
     q.set_defaults(func=cmd_localize)
     s = sub.add_parser("setup", help="clone/patch third-party code and download checkpoints")
+    e = sub.add_parser("export-site", help="export a finished run as a localization-side site folder")
+    e.add_argument("run", type=Path, help="finished run dir (contains artifacts/ and products/)")
+    e.add_argument("--out", type=Path, required=True, help="output dir holding <site_id>/")
+    e.add_argument("--site-id", required=True, help="path-safe slug, e.g. riverside02")
+    e.add_argument("--display-name", default="")
+    e.add_argument("--release-id", default="")
+    e.set_defaults(func=cmd_export_site)
     s.add_argument("rest", nargs=argparse.REMAINDER)
     s.set_defaults(func=cmd_setup)
     return parser

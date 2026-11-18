@@ -144,13 +144,10 @@ def _write_ply(path: Path, binary: bool, n: int = 5) -> None:
 
 
 def test_read_ply_points_binary_and_ascii(tmp_path: Path) -> None:
-    import sys
-    sys.path.insert(0, str(Path("gui").resolve()))
-    import app as gui_app
     for binary in (True, False):
-        p = tmp_path / ("b.ply" if binary else ("a.ply"))
+        p = tmp_path / ("b.ply" if binary else "a.ply")
         _write_ply(p, binary)
-        xyz, rgb, total = gui_app.read_ply_points(p)
+        xyz, rgb, total = jobs.read_ply_points(p)
         assert total == 5 and xyz.shape == (5, 3) and rgb.shape == (5, 3)
         assert abs(xyz[4, 0] - 12.0) < 1e-6 and rgb.dtype.name == "uint8"
 
