@@ -1,0 +1,23 @@
+diff --git a/mast3r/model.py b/mast3r/model.py
+index daee29c..f15458f 100644
+--- a/mast3r/model.py
++++ b/mast3r/model.py
+@@ -21,7 +21,10 @@ inf = float('inf')
+ def load_model(model_path, device, verbose=True):
+     if verbose:
+         print('... loading model from', model_path)
+-    ckpt = torch.load(model_path, map_location='cpu')
++    # DG++ checkpoints store argparse.Namespace in ckpt["args"]. PyTorch 2.6+
++    # defaults to weights_only=True, so this trusted local checkpoint must opt
++    # into the legacy full checkpoint loader explicitly.
++    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+     args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
+     if 'landscape_only' not in args:
+         args = args[:-1] + ', landscape_only=False)'
+@@ -114,4 +117,4 @@ class AsymmetricMASt3R(AsymmetricCroCo3DStereo):
+         if self.add_dg_pred_head:
+             return res1, res2, dopp_pred1, dopp_pred2
+         else:
+-            return res1, res2
+\ No newline at end of file
++            return res1, res2

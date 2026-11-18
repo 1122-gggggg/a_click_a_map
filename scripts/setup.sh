@@ -44,6 +44,8 @@ echo "[1/4] GlueMap (colmap/gluemap @ $(pin gluemap | cut -c1-9)) + local patche
 clone_pinned https://github.com/colmap/gluemap "$TP/gluemap" "$(pin gluemap)"
 git -C "$TP/gluemap" submodule update --init --recursive
 apply_patch "$TP/gluemap" "$HERE/patches/gluemap.patch"
+# DG++ ships as a nested submodule: its weights_only fix lives in its own patch.
+apply_patch "$TP/gluemap/thirdparty/doppelgangers-plusplus" "$HERE/patches/doppelgangers-weights-only.patch"
 echo "[2/4] EDM (chicleee/EDM @ $(pin edm | cut -c1-9))"
 clone_pinned https://github.com/chicleee/EDM "$TP/EDM" "$(pin edm)"
 apply_patch "$TP/EDM" "$HERE/patches/edm.patch"
