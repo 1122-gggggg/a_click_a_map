@@ -29,6 +29,22 @@ PROCS: dict[str, subprocess.Popen] = {}
 VIEWER_MAX_POINTS = 60000
 
 
+def dense_center(xyz, lo, hi):
+    # Mean of the fullest voxel: puts the rotation centre in the densest area.
+    # `lo`/`hi` bound the robust range so runaway points cannot win the vote.
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    span = np.maximum(hi - lo, 1e-9)
+    cell = np.clip(((np.asarray(xyz) - lo) / span * 24.0).astype(int), 0, 23)
+    flat = (cell[:, 0] * 24 + cell[:, 1]) * 24 + cell[:, 2]
+    valid = ((xyz >= lo) & (xyz <= hi)).all(axis=1)
+    if not bool(np.any(valid)):
+        return (lo + hi) / 2.0
+    counts = np.bincount(flat[valid], minlength=24 ** 3)
+    best = int(np.argmax(counts))
+    return xyz[valid][flat[valid] == best].mean(axis=0)
+
+
 def read_ply_points(path: Path) -> tuple:
     """Read an RGB point cloud PLY (ascii or binary_little_endian) as (xyz, rgb, total)."""
     with open(path, "rb") as stream:

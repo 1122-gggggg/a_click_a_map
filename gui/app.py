@@ -151,6 +151,8 @@ class MapViewer:
         self.center = np.zeros(3)
         self.yaw, self.pitch, self.dist = 0.7, 0.45, 10.0
         self.span = np.ones(3)
+        self.fit_span = 1.0
+        self.outlier_ratio = 0.0
         self.expand = expand
         self.height = VIEWER_HEIGHT
         self.image = Gtk.Image()
@@ -184,21 +186,30 @@ class MapViewer:
         self.total = total
         lo, hi = xyz.min(axis=0), xyz.max(axis=0)
         self.span = np.maximum(hi - lo, 1e-9)
-        self.center = (lo + hi) / 2.0
+        # Robust framing: a few runaway triangulations can sit millions of units
+        # out; fitting to min/max would shrink the real scene to invisibility.
+        qlo, qhi = np.percentile(xyz, [1.0, 99.0], axis=0)
+        self.center = jobs.dense_center(xyz, qlo, qhi)
+        self.fit_span = float(np.maximum(qhi - qlo, 1e-9).max())
+        self.outlier_ratio = float(np.mean((xyz < qlo).any(axis=1) | (xyz > qhi).any(axis=1)))
         self.yaw, self.pitch = 0.7, 0.45
-        self.dist = float(self.span.max() * 1.7)
+        self.dist = self.fit_span * 1.7
         self.render()
         return self.info()
 
     def info(self) -> dict:
         return {"points_total": int(self.total), "points_shown": int(len(self.points)),
                 "span": [round(float(v), 3) for v in self.span],
-                "center": [round(float(v), 3) for v in self.center]}
+                "center": [round(float(v), 3) for v in self.center],
+                "outlier_ratio": round(self.outlier_ratio, 4)}
 
     def describe(self) -> str:
         s = self.span
-        return (f"顯示 {len(self.points)}／共 {self.total} 點　範圍 {s[0]:.1f}×{s[1]:.1f}×{s[2]:.1f}（地圖座標，非公尺）　"
+        text = (f"顯示 {len(self.points)}／共 {self.total} 點　範圍 {s[0]:.1f}×{s[1]:.1f}×{s[2]:.1f}（地圖座標，非公尺）　"
                 f"旋轉中心 ({self.center[0]:.2f}, {self.center[1]:.2f}, {self.center[2]:.2f})")
+        if self.outlier_ratio > 0.01:
+            text += f"（{self.outlier_ratio:.1%} 遠點已自動縮放到主體，滾輪縮小可看全部）"
+        return text
 
     def _rotation(self):
         cy, sy, cp, sp = np.cos(self.yaw), np.sin(self.yaw), np.cos(self.pitch), np.sin(self.pitch)
@@ -240,7 +251,7 @@ class MapViewer:
 
     def reset_view(self) -> None:
         self.yaw, self.pitch = 0.7, 0.45
-        self.dist = float(self.span.max() * 1.7)
+        self.dist = float(self.fit_span * 1.7)
         self.render()
         if self.on_change:
             self.on_change()

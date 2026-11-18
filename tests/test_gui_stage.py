@@ -180,3 +180,14 @@ def test_pack_result_lists_bundle(tmp_path) -> None:
     rows = jobs.pack_result({"result_dir": str(tmp_path)})
     assert len(rows) == 1 and rows[0]["path"] == str(bundle)
     assert jobs.map_bundle(str(tmp_path)) == bundle
+
+
+def test_densest_point_ignores_runaways(tmp_path: Path) -> None:
+    import numpy as np
+    rng = np.random.default_rng(0)
+    main = rng.normal([10.0, 20.0, 30.0], 1.0, (2000, 3))
+    outliers = np.array([[1e6, 0.0, 0.0], [-1e6, 5.0, 5.0], [0.0, 1e7, 0.0]])
+    xyz = np.vstack([main, outliers])
+    qlo, qhi = np.percentile(xyz, [1.0, 99.0], axis=0)
+    center = jobs.dense_center(xyz, qlo, qhi)
+    assert np.linalg.norm(center - [10.0, 20.0, 30.0]) < 2.0
