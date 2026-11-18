@@ -301,7 +301,7 @@ class MapViewer:
             self.dist *= 1.15 ** float(getattr(event, "delta_y", 0.0))
         else:
             return False
-        span = float(self.span.max())
+        span = float(getattr(self, "fit_span", 0.0) or 0.0) or float(self.span.max())
         self.dist = min(max(self.dist, span * 0.05), span * 30.0)
         self.render()
         return True
