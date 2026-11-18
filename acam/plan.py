@@ -14,7 +14,9 @@ safety net.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .hw import GIB
 
@@ -164,8 +166,34 @@ def rescale_after_preprocess(actual_keyframes: int, current_scale: float, mem_to
     return round(current_scale * cap / actual_keyframes * 0.95, 3)
 
 
-def eta_hours(keyframes: int) -> float:
-    return keyframes * SECONDS_PER_KEYFRAME / 3600.0
+def measured_spkf(out_dir: str | Path) -> float | None:
+    """Median wall-clock seconds per keyframe from finished runs under out_dir.
+
+    Each finished map writes acam/mapping_summary.json (minutes) next to
+    map_report.json (images_total). After the first run on a machine, the
+    opening `~X h` estimate uses this instead of the RTX 5090 reference.
+    """
+    try:
+        siblings = list(Path(out_dir).iterdir())
+    except OSError:
+        return None
+    samples: list[float] = []
+    for site in siblings:
+        try:
+            minutes = json.loads((site / "acam" / "mapping_summary.json").read_text(encoding="utf-8")).get("minutes")
+            images = json.loads((site / "map_report.json").read_text(encoding="utf-8")).get("images_total")
+            if minutes and images and minutes > 0 and images > 0:
+                samples.append(float(minutes) * 60.0 / float(images))
+        except (OSError, ValueError):
+            continue
+    if not samples:
+        return None
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+def eta_hours(keyframes: int, spkf: float = SECONDS_PER_KEYFRAME) -> float:
+    return keyframes * spkf / 3600.0
 
 
 def is_cuda_oom(log_tail: str) -> bool:

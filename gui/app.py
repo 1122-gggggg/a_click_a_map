@@ -1177,14 +1177,32 @@ class App(Gtk.Window):
         engine_text, engine_age = jobs.read_engine_log_tail(job)
         phase = jobs.parse_mapping_phase(engine_text) if engine_text else {"phase": None, "in_ba": False}
         if stage == 2 and phase.get("phase"):
-            alive = f"（日誌 {int(engine_age)} 秒前更新，程式還活著）" if engine_age is not None else ""
+            alive = f"（日誌 {int(engine_age)} 秒前更新）" if engine_age is not None else ""
             if phase.get("in_ba"):
-                # Misleading 100%: BA has no tqdm, so pulse instead of showing 226/226.
-                self.stage_label.set_text(f"{checklist}\n▶ 建圖：{phase['phase']}{alive}")
+                # Misleading 100%: BA/triangulation have no tqdm, so show the
+                # engine-side phase with measured remaining instead of 226/226.
+                detail = ""
+                if phase.get("done") and phase.get("total"):
+                    detail = f" {phase['done']}/{phase['total']}"
+                    if phase.get("remaining_s") is not None:
+                        detail += f" · 約剩 {format_duration(phase['remaining_s'])}"
+                        if phase.get("rate_per_s"):
+                            detail += f"（{phase['rate_per_s']:.1f}張/秒）"
+                elif phase.get("remaining_s") is not None:
+                    detail = f" · 約剩 {format_duration(phase['remaining_s'])}"
+                    if phase.get("elapsed_s") is not None:
+                        detail += f"（已跑 {format_duration(phase['elapsed_s'])}）"
+                elif phase.get("elapsed_s") is not None:
+                    detail = f"（已跑 {format_duration(phase['elapsed_s'])}）"
+                self.stage_label.set_text(f"{checklist}\n▶ 建圖：{phase['phase']}{detail}{alive}")
                 self.stage_bar.show()
-                self.stage_bar.set_fraction(0.0)
-                self.stage_bar.set_text(f"{phase['phase']}…{alive}")
-                self.stage_bar.pulse()
+                if phase.get("done") and phase.get("total"):
+                    self.stage_bar.set_fraction(phase["done"] / phase["total"])
+                    self.stage_bar.set_text(f"{phase['phase']}{detail}")
+                else:
+                    self.stage_bar.set_fraction(0.0)
+                    self.stage_bar.set_text(f"{phase['phase']}{detail}{alive}")
+                    self.stage_bar.pulse()
                 return
             self.stage_label.set_text(f"{checklist}\n▶ 建圖：{phase['phase']}{alive}")
             self.stage_bar.show()

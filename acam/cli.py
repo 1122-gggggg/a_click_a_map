@@ -166,8 +166,11 @@ def cmd_map(args: argparse.Namespace) -> int:
         f"{plan.keyframe_cap(mem.total, args.max_keyframes)} at the validated setting")
     for note in budget.notes:
         say(f"  budget: {note}")
+    spkf = plan.measured_spkf(out)
+    spkf_note = "measured on this machine" if spkf else "RTX 5090 reference"
+    spkf = spkf or plan.SECONDS_PER_KEYFRAME
     say(f"  using {len(keep)} of {len(videos)} video(s), sampling x{scale:.2f}, ~{budget.est_keyframes} keyframes, "
-        f"~{plan.eta_hours(budget.est_keyframes):.1f} h on an RTX 5090-class GPU")
+        f"~{plan.eta_hours(budget.est_keyframes, spkf):.1f} h ({spkf_note}, {spkf:.1f}s/keyframe)")
     need = 15 * GIB + budget.est_keyframes * 8 * 2**20
     if out.exists() and os.stat(out).st_dev != os.stat(source).st_dev:
         need += sum(sources[k].stat().st_size for k in keep)  # videos get copied next to the run
@@ -227,7 +230,7 @@ def cmd_map(args: argparse.Namespace) -> int:
         if args.dry_run:
             say("dry run: stopping before the GlueMap/EDM run")
             return 0
-        say(f"[2/4] mapping: GlueMap poses -> EDM retriangulation -> MegaLoc bank (~{plan.eta_hours(n_images):.1f} h; "
+        say(f"[2/4] mapping: GlueMap poses -> EDM retriangulation -> MegaLoc bank (~{plan.eta_hours(n_images, spkf):.1f} h; "
             "memory-guarded, auto-retry on OOM)")
         started = time.time()
         mapping = runner.run_map(paths, job, tracks=tracks, scale=scale, max_attempts=args.max_attempts)

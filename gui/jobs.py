@@ -226,6 +226,11 @@ _DICT = re.compile(r"Adding points to dictionary")
 _PROF = re.compile(r"\[Profiling\] Iteration")
 _RETRI = re.compile(r"Retriangulation and Global bundle adjustment")
 _TRI_IMG = re.compile(r"Triangulating image #(\d+)")
+_MERGED = re.compile(r"Created merged database with (\d+) images")
+_TRI_LINE = re.compile(r"^[IW](\d{4})(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)?[^\n]*?Triangulating image #\d+ \((\d+)\)", re.MULTILINE)
+_ROUND_TS = re.compile(r"\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}),\d+\][^\n]*?=== Iteration (\d+)/(\d+) ===")
+_CERES_TS = re.compile(r"\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}),\d+\][^\n]*?Ceres Solver Report")
+_PROF_BA = re.compile(r"\[Profiling\] Iteration \d+:.*?ba=([\d.]+)s")
 
 
 def parse_progress(log_text: str) -> dict:
@@ -275,15 +280,29 @@ def read_engine_log_tail(job: dict, size: int = 200000) -> tuple[str, float | No
         return "", None
 
 
-def parse_mapping_phase(text: str) -> dict:
-    """Human-readable sub-stage inside [2/4] mapping (pure function).
+def _log_epoch(year: str, month: str, day: str, hour: str, minute: str, second: str) -> float:
+    return time.mktime((int(year), int(month), int(day), int(hour), int(minute), int(second), 0, 0, -1))
+
+
+def parse_mapping_phase(text: str, now: float | None = None) -> dict:
+    """Human-readable sub-stage inside [2/4] mapping, with measured remaining time.
 
     The job log's tqdm bar freezes at 226/226 100% once track concatenation
     finishes, while Ceres BA runs for minutes with no new tqdm line. This
-    reads mapping.log so the GUI can say "BA running" instead of looking stuck.
+    reads mapping.log so the GUI can say "BA running" instead of looking stuck,
+    and derives remaining time from the log itself:
+    triangulation rate comes from glog timestamps on the Triangulating lines,
+    BA rounds are predicted from the previous completed round (or the last
+    [Profiling] ba= seconds). `now` is injectable for tests; pass None to use
+    the wall clock. Extra keys (done/total/rate_per_s/elapsed_s/remaining_s)
+    are None when the tail does not support them.
     """
+    blank = {"phase": None, "in_ba": False, "done": None, "total": None,
+             "rate_per_s": None, "elapsed_s": None, "remaining_s": None, "round": None}
     if not text:
-        return {"phase": None, "in_ba": False}
+        return blank
+    if now is None:
+        now = time.time()
     refines = _REFINE.findall(text)
     rounds = _BA_ROUND.findall(text)
     order: list[tuple[int, str]] = []
@@ -300,28 +319,56 @@ def parse_mapping_phase(text: str) -> dict:
     rnd = f"{rounds[-1][0]}/{rounds[-1][1]}" if rounds else None
     if last in ("ba", "round", "ceres") and refine:
         phase = f"全域優化 {refine} · BA 第 {rnd} 輪運算中" if rnd else f"全域優化 {refine} · BA 運算中"
-        return {"phase": phase, "in_ba": True}
+        out = dict(blank, phase=phase, in_ba=True, round=rnd)
+        starts = [(m.start(), _log_epoch(*m.groups()[:6])) for m in _ROUND_TS.finditer(text)]
+        dones = [(m.start(), _log_epoch(*m.groups()[:6])) for m in _CERES_TS.finditer(text)]
+        if starts:
+            out["elapsed_s"] = max(0.0, now - starts[-1][1])
+            prev: float | None = None
+            for pos, t0 in reversed(starts[:-1] if len(starts) > 1 else starts):
+                nxt = next((t1 for p1, t1 in dones if p1 > pos), None)
+                if nxt is not None and nxt > t0:
+                    prev = nxt - t0
+                    break
+            if prev is None:
+                prof = _PROF_BA.findall(text)
+                prev = float(prof[-1]) if prof else None
+            if prev is not None:
+                out["remaining_s"] = max(0.0, prev - out["elapsed_s"])
+        return out
     if last in ("retri", "tri_img"):
-        imgs = _TRI_IMG.findall(text)
-        where = f"（看到第 {imgs[-1]} 張）" if imgs else ""
-        base = f"全域優化 {refine} · 重三角測量＋全域平差（C++ 運算中，無進度條）" if refine else "重三角測量＋全域平差中"
-        return {"phase": base + where, "in_ba": True}
+        total = int(_MERGED.findall(text)[-1]) if _MERGED.findall(text) else None
+        samples = [(_log_epoch(*m.groups()[:6]), int(m.groups()[6])) for m in _TRI_LINE.finditer(text)]
+        out = dict(blank, in_ba=True)
+        if samples:
+            out["done"] = samples[-1][1] + 1
+            out["total"] = total
+            if len(samples) > 1 and samples[-1][0] > samples[0][0]:
+                out["rate_per_s"] = (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0])
+            if total and out["rate_per_s"]:
+                out["remaining_s"] = max(0.0, (total - out["done"]) / out["rate_per_s"])
+        where = f"（看到第 {out['done']}／{total} 張）" if out["done"] and total else ""
+        if not where:
+            imgs = _TRI_IMG.findall(text)
+            where = f"（看到第 {imgs[-1]} 張）" if imgs else ""
+        base = f"全域優化 {refine} · 重三角測量＋全域平差" if refine else "重三角測量＋全域平差中"
+        return dict(out, phase=base + where)
     if last == "tri":
-        return {"phase": f"全域優化 {refine} · 三角測量" if refine else "三角測量中", "in_ba": False}
+        return dict(blank, phase=f"全域優化 {refine} · 三角測量" if refine else "三角測量中")
     if last == "refine":
-        return {"phase": f"全域優化 {refine} 開始" if refine else "全域優化中", "in_ba": False}
+        return dict(blank, phase=f"全域優化 {refine} 開始" if refine else "全域優化中")
     if last == "prof":
-        return {"phase": f"全域優化 {refine} 本輪完成" if refine else "本輪優化完成", "in_ba": False}
+        return dict(blank, phase=f"全域優化 {refine} 本輪完成" if refine else "本輪優化完成")
     if last == "tracks":
         m = _TRACKS_DONE.findall(text)[-1]
-        return {"phase": f"軌跡建立完成（{m[0]} 條／{m[1]} 觀測），進全域優化", "in_ba": False}
+        return dict(blank, phase=f"軌跡建立完成（{m[0]} 條／{m[1]} 觀測），進全域優化")
     if last == "concat":
-        return {"phase": "串接軌跡中（這條 100% 之後還有 BA，別被騙）", "in_ba": False}
+        return dict(blank, phase="串接軌跡中（這條 100% 之後還有 BA，別被騙）")
     if last == "corr":
-        return {"phase": "建立對應中", "in_ba": False}
+        return dict(blank, phase="建立對應中")
     if last == "dict":
-        return {"phase": "建立點字典中", "in_ba": False}
-    return {"phase": None, "in_ba": False}
+        return dict(blank, phase="建立點字典中")
+    return blank
 
 
 def read_log_tail(job_id: str, size: int = 50000) -> str:
@@ -432,6 +479,32 @@ def expand_videos(entries: list[str]) -> list[Path]:
     return list(unique.values())
 
 
+def map_output_status(out_raw: str, name_raw: str) -> str | None:
+    """Why out/name cannot start a fresh map (None when free to use).
+
+    result_dir is out/name with no uniqueness, and the engine resumes from
+    existing caches. A same-name rerun with different videos would silently
+    reuse the old map, so a fresh task must pick another name (or the old
+    folder must be deleted first). Partial failed runs without a report are
+    still allowed so the engine can resume them.
+    """
+    base = Path(out_raw or "").expanduser() / safe_name(name_raw or "site", "site")
+    if not base.is_dir():
+        return None
+    try:
+        data = json.loads((base / "map_report.json").read_text(encoding="utf-8"))
+        if data.get("images_total"):
+            link = "各影片相連" if data.get("connected") else "多段不相連"
+            return (f"「{base.name}」已有完成的建圖（{data.get('images_registered', '?')}/"
+                    f"{data.get('images_total', '?')} 張，{link}）：換個任務名稱，或刪掉 {base} 再跑")
+    except (OSError, ValueError):
+        pass
+    for marker in ("MAP_REPORT.md", "map/sparse_rgb.ply", "pipeline_receipt.json"):
+        if (base / marker).exists():
+            return f"「{base.name}」已有建圖輸出（{marker}）：換個任務名稱，或刪掉 {base} 再跑"
+    return None
+
+
 def validate_map_request(request: dict) -> tuple[bool, str]:
     """Lightweight pre-flight check for the 建圖 form: (ready, reason).
 
@@ -449,6 +522,9 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
     intrinsics = (request.get("intrinsics") or "").strip()
     if intrinsics and not Path(intrinsics).expanduser().is_file():
         return False, f"找不到標定檔：{intrinsics}"
+    taken = map_output_status(request.get("out"), request.get("name"))
+    if taken:
+        return False, taken
     if engine == "original":
         try:
             count = sum(1 for _ in expand_videos(entries))
@@ -534,6 +610,10 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
     intrinsics = (request.get("intrinsics") or "").strip()
     if intrinsics and not Path(intrinsics).expanduser().is_file():
         raise ValueError(f"找不到標定檔: {intrinsics}")
+    if not request.get("_resume"):
+        taken = map_output_status(str(out), name)
+        if taken:
+            raise ValueError(taken)
     if engine == "original":
         videos = expand_videos(entries)
         try:
@@ -672,6 +752,7 @@ def resume_request(job: dict) -> dict:
     """
     request = dict(job.get("request", {}))
     request.update(kind=job.get("kind"), engine=job.get("engine"))
+    request["_resume"] = True  # same out/name on purpose: continue from stage caches
     return request
 
 

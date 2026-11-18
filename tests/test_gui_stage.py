@@ -284,4 +284,92 @@ def test_parse_mapping_phase_ba_and_retri() -> None:
     retri = "Refinement iteration 2/2\nRetriangulation and Global bundle adjustment\nTriangulating image #226 (225)\n"
     info = jobs.parse_mapping_phase(retri)
     assert info["in_ba"] and "226" in info["phase"]
-    assert jobs.parse_mapping_phase("") == {"phase": None, "in_ba": False}
+    blank = jobs.parse_mapping_phase("")
+    assert blank["phase"] is None and not blank["in_ba"]
+
+
+def test_map_output_status_blocks_finished_name(tmp_path) -> None:
+    import json
+    site = tmp_path / "out" / "testtest"
+    (site / "acam").mkdir(parents=True)
+    (site / "acam" / "mapping_summary.json").write_text(json.dumps({"minutes": 26.9}))
+    (site / "map_report.json").write_text(json.dumps(
+        {"images_registered": 226, "images_total": 226, "connected": False,
+         "video_components": [["a"], ["b"]]}))
+    msg = jobs.map_output_status(str(tmp_path / "out"), "testtest")
+    assert msg and "換個任務名稱" in msg and "多段不相連" in msg
+    assert jobs.map_output_status(str(tmp_path / "out"), "fresh") is None
+    assert jobs.map_output_status(str(tmp_path / "nope"), "x") is None
+    # partial failed run without a report stays resumable
+    (tmp_path / "out" / "half" / "run").mkdir(parents=True)
+    assert jobs.map_output_status(str(tmp_path / "out"), "half") is None
+
+
+def test_same_name_fresh_task_blocked_but_resume_passes(tmp_path, monkeypatch) -> None:
+    import json
+    from pathlib import Path as _P
+    site = tmp_path / "out" / "dup"
+    (site / "acam").mkdir(parents=True)
+    (site / "acam" / "mapping_summary.json").write_text(json.dumps({"minutes": 1.0}))
+    (site / "map_report.json").write_text(json.dumps(
+        {"images_registered": 10, "images_total": 10, "connected": True, "video_components": [["a"]]}))
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    vid = tmp_path / "v.mp4"
+    vid.write_bytes(b"\x00" * 64)
+    req = {"engine": "original", "videos": [str(vid)], "name": "dup",
+           "out": str(tmp_path / "out"), "intrinsics": "", "dense": False}
+    ok, message = jobs.validate_map_request(req)
+    assert not ok and "換個任務名稱" in message
+    try:
+        jobs.build_map_command(req, "job1")
+    except ValueError as error:
+        assert "換個任務名稱" in str(error)
+    else:
+        raise AssertionError("fresh same-name build must fail")
+    resumed = jobs.resume_request({"kind": "map", "engine": "original", "request": dict(req)})
+    assert resumed["_resume"]
+    monkeypatch.setattr(jobs, "stage_selection", lambda videos, dest: dest)
+    _cmd, meta = jobs.build_map_command(resumed, "job2")
+    assert meta["result_dir"] == str(_P(str(tmp_path / "out")) / "dup")
+
+
+def test_measured_spkf_prefers_history(tmp_path) -> None:
+    import json
+    from acam import plan
+    assert plan.measured_spkf(tmp_path / "empty") is None
+    for name, minutes, images in (("a", 26.9, 226), ("b", 13.5, 113)):
+        site = tmp_path / name
+        (site / "acam").mkdir(parents=True)
+        (site / "acam" / "mapping_summary.json").write_text(json.dumps({"minutes": minutes}))
+        (site / "map_report.json").write_text(json.dumps({"images_total": images}))
+    got = plan.measured_spkf(tmp_path)
+    assert min(26.9 * 60 / 226, 13.5 * 60 / 113) <= got <= max(26.9 * 60 / 226, 13.5 * 60 / 113)
+    assert plan.eta_hours(226, got) == pytest.approx(26.9 / 60, rel=0.02)
+    assert plan.eta_hours(226) == pytest.approx(226 * plan.SECONDS_PER_KEYFRAME / 3600)
+
+
+def test_phase_remaining_triangulation() -> None:
+    head = ("[2026-11-18 17:37:15,341] INFO:gluemap.estimators.track_establishment: Established 26144 tracks\n"
+            "Refinement iteration 2/2\n"
+            "[2026-11-18 17:38:25,804] INFO:gluemap.controllers.augmented_bundle_adjustment: Starting iterative BA\n"
+            "Created merged database with 226 images\n")
+    body = "".join(
+        f"I20261118 17:45:{40 + i:02d}.100000 1 incremental_pipeline.cc:751] "
+        f"Triangulating image #{200 + i} ({199 + i})\n" for i in range(10))
+    info = jobs.parse_mapping_phase(head + body)
+    assert info["in_ba"] and info["done"] == 209 and info["total"] == 226
+    assert info["rate_per_s"] == pytest.approx(1.0, rel=0.05)
+    assert info["remaining_s"] == pytest.approx((226 - 209) / info["rate_per_s"], rel=0.01)
+
+
+def test_phase_remaining_ba_uses_previous_round() -> None:
+    log = ("Refinement iteration 1/2\n"
+           "[2026-11-18 17:38:26,235] INFO: x === Iteration 1/3 ===\n"
+           "[2026-11-18 17:39:54,428] INFO: x Ceres Solver Report: Iterations: 60\n"
+           "[2026-11-18 17:40:04,755] INFO: x === Iteration 2/3 ===\n")
+    now = jobs._log_epoch("2026", "11", "18", "17", "40", "44")
+    info = jobs.parse_mapping_phase(log, now=now)
+    assert info["in_ba"] and info["round"] == "2/3"
+    assert info["elapsed_s"] == pytest.approx(40.0, abs=1.0)
+    # round 1 took ~88s, 40s into round 2 -> ~48s left
+    assert info["remaining_s"] == pytest.approx(88.0 - 40.0, abs=2.0)
