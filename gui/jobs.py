@@ -145,6 +145,35 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
     return False, "未知的建圖方式"
 
 
+APPROVAL_FILE = ".acam_map_approved.json"
+
+
+def map_pointcloud(job: dict) -> Path | None:
+    """The inspectable RGB point cloud of a finished map job, if it exists."""
+    base = Path(job.get("result_dir", ""))
+    if job["engine"] == "moge3":
+        cand = base / "map/sparse_rgb.ply"
+    else:
+        cand = base / "run/products/map/original_rgb.ply"
+    return cand if cand.is_file() else None
+
+
+def is_map_approved(map_dir: str | Path) -> tuple[bool, dict]:
+    """Whether this map folder was confirmed good in the 3D inspection view."""
+    path = Path(map_dir).expanduser() / APPROVAL_FILE
+    try:
+        return True, json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, {}
+
+
+def approve_map(map_dir: str | Path, info: dict | None = None) -> dict:
+    """Record the operator's map inspection approval inside the map folder."""
+    marker = {"approved_at": time.time(), **(info or {})}
+    path = Path(map_dir).expanduser() / APPROVAL_FILE
+    path.write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+    return marker
+
 def validate_cruise_request(request: dict) -> tuple[bool, str]:
     """Lightweight pre-flight check for the 巡航定位 form: (ready, reason)."""
     engine = request.get("engine")
@@ -158,6 +187,9 @@ def validate_cruise_request(request: dict) -> tuple[bool, str]:
         return False, "還沒選擇已建好的地圖"
     if not Path(request.get("map") or "").expanduser().is_dir():
         return False, f"找不到地圖資料夾：{request.get('map', '')}"
+    approved, _ = is_map_approved(Path(request.get("map") or "").expanduser())
+    if not approved:
+        return False, "這張地圖還沒檢查確認：先在建圖結果打開 3D 檢視，確認沒問題後按「✓ 確認地圖可用」"
     return True, "就緒：按「開始巡航定位」"
 
 def build_map_command(request: dict) -> tuple[list[str], dict]:
@@ -196,6 +228,9 @@ def build_cruise_command(request: dict, job_id: str) -> tuple[list[str] | str, d
     map_dir = Path(request.get("map") or "").expanduser()
     if not map_dir.is_dir():
         raise ValueError("找不到地圖資料夾")
+    approved, _ = is_map_approved(map_dir)
+    if not approved:
+        raise ValueError("這張地圖還沒檢查確認：先在建圖結果打開 3D 檢視，確認沒問題後按「✓ 確認地圖可用」")
     route = safe_name(request.get("route") or video.stem, "route")
     out = job_dir(job_id) / "cruise"
     meta = {"name": route, "result_dir": str(out)}

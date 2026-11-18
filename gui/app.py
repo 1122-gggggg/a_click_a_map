@@ -8,6 +8,7 @@
     巡航定位： ① 選一張已建好的地圖 → ② 選一部巡航影片 → ③ 按「開始巡航定位」
 右邊顯示任務列表、執行日誌與結果。按鈕在條件沒湊齊時會變灰，
 下方會直接告訴你還缺什麼（不用等到按下去才被罵）。
+建圖完成後，先在 3D 檢視確認地圖沒問題並按下確認，巡航定位才會放行。
 Works with both entry points of this repository: ./run_moge3.sh (MoGe-3 version) and ./run.sh (original).
 Needs the distribution's python3 with PyGObject + GTK 3 (Ubuntu desktop has it: python3-gi, gir1.2-gtk-3.0).
 """
@@ -19,6 +20,8 @@ import sys
 import time
 import zlib
 from pathlib import Path
+
+import numpy as np
 
 import gi
 
@@ -126,6 +129,233 @@ def format_duration(seconds: float) -> str:
     minutes, secs = divmod(rest, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
+
+VIEWER_MAX_POINTS = 60000
+VIEWER_HEIGHT = 300
+
+
+def read_ply_points(path: Path) -> tuple:
+    """Read an RGB point cloud PLY (ascii or binary_little_endian) as (xyz, rgb, total).
+
+    xyz is float64 (M, 3), rgb is uint8 (M, 3). Raises on anything unexpected.
+    """
+    with open(path, "rb") as stream:
+        header = []
+        while True:
+            line = stream.readline().decode("ascii", errors="replace").strip()
+            header.append(line)
+            if line == "end_header":
+                break
+            if len(header) > 200:
+                raise ValueError("PLY header too long")
+    count, props, current = 0, [], None
+    for line in header:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "format":
+            pass
+        elif parts[0] == "element":
+            current = parts[1]
+            if current == "vertex":
+                count, props = int(parts[2]), []
+        elif parts[0] == "property" and current == "vertex":
+            props.append((parts[1], parts[2]))
+    if count <= 0 or not props:
+        raise ValueError("PLY has no vertices")
+    names = [name for _, name in props]
+    if "x" not in names or "y" not in names or "z" not in names:
+        raise ValueError("PLY vertices lack x/y/z")
+    rgb_names = ("red", "green", "blue") if "red" in names else (("r", "g", "b") if "r" in names else ())
+    kind_to_dtype = {"char": "i1", "uchar": "u1", "short": "i2", "ushort": "u2",
+                     "int": "i4", "uint": "u4", "float": "f4", "double": "f8"}
+    is_ascii = "format ascii 1.0" in header
+    if not is_ascii:
+        dtype = [(name, kind_to_dtype[kind]) for kind, name in props]
+        with open(path, "rb") as stream:
+            offset = sum(len((line + "\n").encode("ascii", errors="replace")) for line in header)
+            raw = np.fromfile(stream, dtype=dtype, count=count, offset=offset)
+        xyz = np.column_stack([raw["x"].astype(np.float64), raw["y"].astype(np.float64),
+                               raw["z"].astype(np.float64)])
+        rgb = (np.column_stack([np.asarray(raw[n]).astype(np.uint8) for n in rgb_names])
+               if rgb_names else np.full_like(xyz, 160, dtype=np.uint8))
+    else:
+        rows = np.genfromtxt(str(path), dtype=[(n, kind_to_dtype[k]) for k, n in props],
+                             skip_header=len(header), max_rows=count)
+        xyz = np.column_stack([rows["x"].astype(np.float64), rows["y"].astype(np.float64),
+                               rows["z"].astype(np.float64)])
+        rgb = (np.column_stack([np.asarray(rows[n]).astype(np.uint8) for n in rgb_names])
+               if rgb_names else np.full_like(xyz, 160, dtype=np.uint8))
+    return xyz, rgb, count
+
+
+class MapViewer:
+    """Software-rendered RGB point cloud inspector (no GL needed).
+
+    左鍵拖曳旋轉，左鍵點兩下把旋轉中心換到點到的位置，
+    右鍵拖曳平移，滾輪縮放。Renders into a Gtk.Image via numpy.
+    """
+
+    BG = (13, 17, 23)
+    MARK = (255, 180, 0)
+
+    def __init__(self) -> None:
+        self.points = np.zeros((0, 3))
+        self.colors = np.zeros((0, 3), dtype=np.uint8)
+        self.total = 0
+        self.center = np.zeros(3)
+        self.yaw, self.pitch, self.dist = 0.7, 0.45, 10.0
+        self.span = np.ones(3)
+        self.image = Gtk.Image()
+        self.image.set_size_request(-1, VIEWER_HEIGHT)
+        self.box = Gtk.EventBox()
+        self.box.add(self.image)
+        self.box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                            | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
+        self.box.connect("button-press-event", self.on_press)
+        self.box.connect("button-release-event", self.on_release)
+        self.box.connect("motion-notify-event", self.on_motion)
+        self.box.connect("scroll-event", self.on_scroll)
+        self.box.connect("size-allocate", lambda _w, _a: self.render())
+        self.drag_button = 0
+        self.last = (0.0, 0.0)
+        self.on_change = None
+
+    def load(self, path: Path) -> dict:
+        xyz, rgb, total = read_ply_points(path)
+        step = max(1, len(xyz) // VIEWER_MAX_POINTS)
+        self.points = xyz[::step]
+        self.colors = rgb[::step]
+        self.total = total
+        lo, hi = xyz.min(axis=0), xyz.max(axis=0)
+        self.span = np.maximum(hi - lo, 1e-9)
+        self.center = (lo + hi) / 2.0
+        self.yaw, self.pitch = 0.7, 0.45
+        self.dist = float(self.span.max() * 1.7)
+        self.render()
+        return self.info()
+
+    def info(self) -> dict:
+        return {"points_total": int(self.total), "points_shown": int(len(self.points)),
+                "span": [round(float(v), 3) for v in self.span],
+                "center": [round(float(v), 3) for v in self.center]}
+
+    def describe(self) -> str:
+        s = self.span
+        return (f"顯示 {len(self.points)}／共 {self.total} 點　範圍 {s[0]:.1f}×{s[1]:.1f}×{s[2]:.1f}（地圖座標，非公尺）　"
+                f"旋轉中心 ({self.center[0]:.2f}, {self.center[1]:.2f}, {self.center[2]:.2f})")
+
+    def _rotation(self):
+        cy, sy, cp, sp = np.cos(self.yaw), np.sin(self.yaw), np.cos(self.pitch), np.sin(self.pitch)
+        return np.array([[cy, 0.0, sy], [sy * sp, cp, -cy * sp], [-sy * cp, sp, cy * cp]])
+
+    def _project(self, width: int, height: int):
+        rot = self._rotation()
+        cam = (self.points - self.center) @ rot.T
+        depth = cam[:, 2] + self.dist
+        focal = height * 1.3
+        ok = depth > 1e-6
+        sx = np.full(len(self.points), -1)
+        sy = np.full(len(self.points), -1)
+        sx[ok] = (width / 2.0 + focal * cam[ok, 0] / depth[ok]).astype(int)
+        sy[ok] = (height / 2.0 - focal * cam[ok, 1] / depth[ok]).astype(int)
+        return sx, sy, depth, ok, rot, focal
+
+    def render(self) -> None:
+        width = max(self.box.get_allocated_width(), 320)
+        height = VIEWER_HEIGHT
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        canvas[:, :] = self.BG
+        if len(self.points):
+            sx, sy, depth, ok, _, _ = self._project(width, height)
+            inside = ok & (sx >= 0) & (sx < width) & (sy >= 0) & (sy < height)
+            if np.any(inside):
+                d = depth[inside]
+                shade = (0.45 + 0.55 * (1.0 - (d - d.min()) / max(d.max() - d.min(), 1e-9)))[:, None]
+                order = np.argsort(d)[::-1]
+                flat = sy[inside][order] * width + sx[inside][order]
+                canvas.reshape(-1, 3)[flat] = (self.colors[inside][order] * shade[order]).astype(np.uint8)
+            x, y = width // 2, height // 2
+            for o in range(-5, 6):
+                for xx, yy in ((x + o, y), (x, y + o)):
+                    if 0 <= xx < width and 0 <= yy < height:
+                        canvas[yy, xx] = self.MARK
+        data = GLib.Bytes(canvas.tobytes())
+        self.image.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_bytes(data, GdkPixbuf.Colorspace.RGB, False, 8, width, height, width * 3))
+
+    def reset_view(self) -> None:
+        self.yaw, self.pitch = 0.7, 0.45
+        self.dist = float(self.span.max() * 1.7)
+        self.render()
+        if self.on_change:
+            self.on_change()
+
+    def on_press(self, _w, event) -> bool:
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            self.recenter(event.x, event.y)
+            return True
+        if event.button in (1, 3):
+            self.drag_button = event.button
+            self.last = (event.x, event.y)
+            return True
+        return False
+
+    def on_release(self, _w, event) -> bool:
+        if event.button == self.drag_button:
+            self.drag_button = 0
+            return True
+        return False
+
+    def on_motion(self, _w, event) -> bool:
+        if not self.drag_button or not len(self.points):
+            return False
+        dx, dy = event.x - self.last[0], event.y - self.last[1]
+        self.last = (event.x, event.y)
+        if self.drag_button == 1:
+            self.yaw += dx * 0.008
+            self.pitch = min(1.5, max(-1.5, self.pitch + dy * 0.008))
+        else:
+            rot = self._rotation()
+            scale = self.dist / (VIEWER_HEIGHT * 1.3)
+            right, up = rot.T[:, 0], -rot.T[:, 1]
+            self.center = self.center + right * dx * scale - up * dy * scale
+        self.render()
+        if self.on_change:
+            self.on_change()
+        return True
+
+    def on_scroll(self, _w, event) -> bool:
+        if not len(self.points):
+            return False
+        if event.direction == Gdk.ScrollDirection.UP:
+            self.dist /= 1.15
+        elif event.direction == Gdk.ScrollDirection.DOWN:
+            self.dist *= 1.15
+        elif event.direction == Gdk.ScrollDirection.SMOOTH:
+            self.dist *= 1.15 ** float(getattr(event, "delta_y", 0.0))
+        else:
+            return False
+        span = float(self.span.max())
+        self.dist = min(max(self.dist, span * 0.05), span * 30.0)
+        self.render()
+        return True
+
+    def recenter(self, x: float, y: float) -> None:
+        if not len(self.points):
+            return
+        width = max(self.box.get_allocated_width(), 320)
+        sx, sy, _, ok, _, _ = self._project(width, VIEWER_HEIGHT)
+        cand = ok & (sx >= 0) & (sx < width) & (sy >= 0) & (sy < VIEWER_HEIGHT)
+        if not np.any(cand):
+            return
+        d2 = (sx[cand] - x) ** 2 + (sy[cand] - y) ** 2
+        if float(d2.min()) > 18.0 ** 2:
+            return
+        idx = np.flatnonzero(cand)[int(d2.argmin())]
+        self.center = self.points[idx].copy()
+        self.render()
+        if self.on_change:
+            self.on_change()
 
 class App(Gtk.Window):
     def __init__(self) -> None:
@@ -372,7 +602,7 @@ class App(Gtk.Window):
         top.pack_end(self.stop_button, False, False, 0)
         box.pack_start(top, False, False, 4)
 
-        box.pack_start(css_label("結果（完成後出現在這裡，檔名點兩下可直接開啟）", "step"), False, False, 0)
+        box.pack_start(css_label("結果（完成後出現在這裡；建圖先在 3D 檢視確認，檔名點兩下可直接開啟）", "step"), False, False, 0)
         self.result_stack = Gtk.Stack()
         self.result_hint = css_label("任務完成後顯示結果", "hint")
         self.result_stack.add_named(self.result_hint, "hint")
@@ -386,9 +616,35 @@ class App(Gtk.Window):
             column.set_resizable(True)
             files.append_column(column)
         files.connect("row-activated", self.open_result_row)
+        map_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.viewer_frame = Gtk.Frame(label=" 3D 檢查：左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪縮放 ")
+        viewer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=6)
+        self.viewer = MapViewer()
+        self.viewer.on_change = self.update_viewer_label
+        viewer_box.pack_start(self.viewer.box, False, False, 0)
+        self.viewer_label = css_label("", "hint", wrap=True)
+        viewer_box.pack_start(self.viewer_label, False, False, 0)
+        approval_row = Gtk.Box(spacing=6)
+        self.approval_label = css_label("", "hint")
+        self.approval_label.set_line_wrap(True)
+        approval_row.pack_start(self.approval_label, True, True, 0)
+        self.approve_button = Gtk.Button(label="✓ 確認地圖可用，可以巡航")
+        self.approve_button.set_tooltip_text("在上方 3D 檢視裡轉一轉、確認地圖沒有明顯問題後再按。按了巡航定位才會放行。")
+        self.approve_button.connect("clicked", self.approve_current_map)
+        approval_row.pack_start(self.approve_button, False, False, 0)
+        reset_button = Gtk.Button(label="重設視角")
+        reset_button.set_tooltip_text("回到一開始的整體視角")
+        reset_button.connect("clicked", lambda _b: self.viewer.reset_view())
+        approval_row.pack_start(reset_button, False, False, 0)
+        viewer_box.pack_start(approval_row, False, False, 0)
+        self.viewer_frame.add(viewer_box)
+        map_page.pack_start(self.viewer_frame, False, False, 0)
         file_scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
         file_scroll.add(files)
-        self.result_stack.add_named(file_scroll, "files")
+        map_page.pack_start(file_scroll, True, True, 0)
+        self.result_stack.add_named(map_page, "files")
+        self.approved_dir = None
+        self.viewer_info = {}
         cruise = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.cruise_summary = Gtk.Label(xalign=0)
         self.coverage_bar = Gtk.ProgressBar(show_text=True)
@@ -498,7 +754,8 @@ class App(Gtk.Window):
         self.add_files_button.set_sensitive(not original)
         self.video_hint.set_text("原始版：只能加入「一個」影片資料夾，多選檔案沒用" if original else "可加入多個資料夾或影片檔，會自動找出裡面的影片")
         self.skip_dense.set_sensitive(not original)
-        self.map_pick_hint.set_text("原始版：選含 run/ 的資料夾" if original else "MoGe-3 版：選含 localization/bundle 的資料夾")
+        self.map_pick_hint.set_text(("原始版：選含 run/ 的資料夾" if original else "MoGe-3 版：選含 localization/bundle 的資料夾")
+                                    + "；巡航前需先在建圖結果按「✓ 確認地圖可用」")
         self.refresh_map_choices(force=True)
         self.update_readiness()
 
@@ -509,7 +766,10 @@ class App(Gtk.Window):
 
     def refresh_map_choices(self, force: bool = False) -> None:
         done = [j for j in jobs.list_jobs() if j["kind"] == "map" and j["status"] == "done" and j["engine"] == self.engine]
-        mapping = {f"{j['name']} — {j['result_dir']}": j["result_dir"] for j in done}
+        mapping = {}
+        for j in done:
+            ok, _ = jobs.is_map_approved(j["result_dir"])
+            mapping[f"{'✓' if ok else '○'} {j['name']} — {j['result_dir']}"] = j["result_dir"]
         if force or mapping != self.cruise_maps:
             self.cruise_maps = mapping
             self.map_pick.remove_all()
@@ -681,8 +941,61 @@ class App(Gtk.Window):
             self.shown = (job["id"], job["status"])
             self.show_result(job)
 
+    def update_viewer_label(self) -> None:
+        self.viewer_label.set_text(self.viewer.describe())
+
+    def load_map_viewer(self, job: dict) -> None:
+        """Show the 3D inspection + approval bar for a finished map job."""
+        self.approved_dir = job.get("result_dir", "")
+        ply = jobs.map_pointcloud(job) if job["status"] == "done" else None
+        if ply is None:
+            self.viewer_frame.hide()
+            self.viewer_info = {}
+        else:
+            try:
+                self.viewer_info = self.viewer.load(ply)
+            except (OSError, ValueError) as error:
+                self.viewer_frame.hide()
+                self.viewer_info = {}
+                self.viewer_label.set_text(f"3D 檢視載入失敗：{error}")
+                return
+            self.viewer_frame.show_all()
+            self.update_viewer_label()
+        self.refresh_approval_ui()
+
+    def refresh_approval_ui(self) -> None:
+        if not self.approved_dir:
+            return
+        approved, info = jobs.is_map_approved(self.approved_dir)
+        if approved:
+            when = time.strftime("%m-%d %H:%M", time.localtime(info.get("approved_at", 0)))
+            self.approval_label.set_markup(
+                f'<span foreground="#1a7f37" weight="bold">✓ 已確認可用（{GLib.markup_escape_text(when)}）</span>'
+                "　巡航定位已放行；若改了主意可再按一次重新確認")
+            self.approve_button.set_label("↻ 重新確認")
+        else:
+            self.approval_label.set_text("○ 尚未確認：先在上方 3D 檢視檢查地圖（轉一轉、放大看看有沒有明顯破碎或錯位），沒問題再按右邊確認")
+            self.approve_button.set_label("✓ 確認地圖可用，可以巡航")
+        self.approve_button.set_sensitive(bool(self.viewer_info) or approved)
+
+    def approve_current_map(self, _button=None) -> None:
+        if not self.approved_dir:
+            return
+        try:
+            info = dict(self.viewer_info)
+            jobs.approve_map(self.approved_dir, info)
+        except OSError as error:
+            self.error(f"寫入確認紀錄失敗：{error}")
+            return
+        self.refresh_approval_ui()
+        self.refresh_map_choices(force=True)
+        self.update_readiness()
+
     def show_result(self, job: dict | None) -> None:
         self.plot_points = []
+        if job is None or job["kind"] != "map":
+            self.approved_dir = None
+            self.viewer_frame.hide()
         if job is None:
             self.result_hint.set_text("任務完成後顯示結果")
             self.result_stack.set_visible_child_name("hint")
@@ -700,6 +1013,7 @@ class App(Gtk.Window):
                         else "尚無產出檔案")
                 self.result_hint.set_text(hint)
                 self.result_stack.set_visible_child_name("hint")
+            self.load_map_viewer(job)
             return
         data = jobs.cruise_result(job)
         if data is None:

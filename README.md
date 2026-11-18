@@ -15,8 +15,23 @@
 ```
 
 介面可加入影片、設定並啟動建圖、即時看日誌與停止任務；「巡航定位」分頁選一張建好的地圖與一支查詢影片，顯示位姿覆蓋率、狀態統計與航跡俯視圖。
+建圖完成後，先在結果區的 3D 檢視裡轉一轉確認地圖沒問題並按下確認，巡航定位才會放行。
 只需要系統自帶的 `python3` + GTK 3（Ubuntu 桌面預設有；`python3-gi`、`gir1.2-gtk-3.0`），不需額外安裝套件。
 操作說明（圖文，給操作人員）：[`docs/操作說明.pdf`](docs/操作說明.pdf)；工程人員安裝：[`docs/工程人員安裝說明.md`](docs/工程人員安裝說明.md)。
+
+## 從零開始（第一次拿到這份程式）
+
+```bash
+git clone https://github.com/1122-gggggg/a_click_a_map && cd a_click_a_map
+./scripts/setup.sh              # 原始版：釘住第三方程式＋套 patch＋下載權重（EDM 權重需自備，見下）
+moge3/scripts/setup.sh          # MoGe-3 版（另見 moge3/README.md）
+./run.sh doctor                 # 全綠才算裝好
+./安裝桌面捷徑.sh                # 桌面出現「無人機自動建圖巡航系統」，之後雙擊即可
+```
+
+EDM 權重不會自動下載：把 `edm_outdoor.ckpt` 放到 `third_party/EDM/weights/`（或設 `ACAM_EDM_CHECKPOINT`）。
+有結案包（`third_party/moge3` 已內含原始碼與權重）時改看 [`docs/工程人員安裝說明.md`](docs/工程人員安裝說明.md) §3。
+操作流程（圖文，給操作人員）：[`docs/操作說明.pdf`](docs/操作說明.pdf)。
 
 ---
 
