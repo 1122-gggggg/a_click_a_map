@@ -565,6 +565,68 @@ def create_job(request: dict) -> dict:
     return job
 
 
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _descendants(pid: int) -> list[int]:
+    """All live PIDs in `pid`'s subtree, via /proc (children that escaped the group too)."""
+    try:
+        children: dict[int, list[int]] = {}
+        alive: set[int] = set()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                parts = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                child, ppid = int(entry.name), int(parts[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            alive.add(child)
+            children.setdefault(ppid, []).append(child)
+    except OSError:
+        return []
+    found: list[int] = []
+    stack = [pid]
+    while stack:
+        current = stack.pop()
+        for child in children.get(current, []):
+            if child in alive:
+                found.append(child)
+                stack.append(child)
+    return found
+
+
+def _kill_tree(pid: int, timeout: float = 10.0) -> None:
+    """SIGTERM the group, then any escaped descendants; SIGKILL stragglers."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rest = [p for p in _descendants(pid) if p != os.getpid() and _process_alive(p)]
+        if not _process_alive(pid) and not rest:
+            return
+        for p in rest:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(0.5)
+    for p in [pid, *_descendants(pid)]:
+        try:
+            os.kill(-p if p == pid else p, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def stop_job(job_id: str) -> None:
     with LOCK:
         proc = PROCS.get(job_id)
@@ -573,7 +635,7 @@ def stop_job(job_id: str) -> None:
     job = read_job(job_id)
     job["status"] = "stopped"
     write_job(job)
-    os.killpg(proc.pid, signal.SIGTERM)
+    _kill_tree(proc.pid)
 
 
 def stop_all() -> int:
