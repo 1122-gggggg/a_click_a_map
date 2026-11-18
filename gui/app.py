@@ -38,6 +38,7 @@ STATUS_COLOR = {"queued": "#9a6700", "running": "#9a6700", "done": "#1a7f37", "f
 POSE_COLOR = {"RELOC_SEED": (63, 185, 80), "FAST_TRACK": (58, 160, 255), "VO_ONLY": (210, 153, 34),
               "DEAD_RECKON": (163, 113, 247), "NO_POSE": (248, 81, 73)}
 POSE_NAME = {"RELOC_SEED": "重新定位", "FAST_TRACK": "追蹤中", "VO_ONLY": "里程計", "DEAD_RECKON": "推算", "NO_POSE": "無位姿"}
+KIND_NAME = {"map": "建圖", "cruise": "巡航定位", "pack": "打包"}
 FINAL = ("done", "failed", "stopped", "interrupted")
 CSS = b"""
 * { font-size: 11pt; }
@@ -199,15 +200,18 @@ class MapViewer:
     BG = (13, 17, 23)
     MARK = (255, 180, 0)
 
-    def __init__(self) -> None:
+    def __init__(self, *, expand: bool = False) -> None:
         self.points = np.zeros((0, 3))
         self.colors = np.zeros((0, 3), dtype=np.uint8)
         self.total = 0
         self.center = np.zeros(3)
         self.yaw, self.pitch, self.dist = 0.7, 0.45, 10.0
         self.span = np.ones(3)
+        self.expand = expand
+        self.height = VIEWER_HEIGHT
         self.image = Gtk.Image()
-        self.image.set_size_request(-1, VIEWER_HEIGHT)
+        if not expand:
+            self.image.set_size_request(-1, VIEWER_HEIGHT)
         self.box = Gtk.EventBox()
         self.box.add(self.image)
         self.box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -216,10 +220,17 @@ class MapViewer:
         self.box.connect("button-release-event", self.on_release)
         self.box.connect("motion-notify-event", self.on_motion)
         self.box.connect("scroll-event", self.on_scroll)
-        self.box.connect("size-allocate", lambda _w, _a: self.render())
+        self.box.connect("size-allocate", self.on_allocate)
         self.drag_button = 0
         self.last = (0.0, 0.0)
         self.on_change = None
+
+    def on_allocate(self, _widget, _allocation) -> None:
+        if self.expand:
+            fitted = max(self.box.get_allocated_height(), 200)
+            if fitted != self.height:
+                self.height = fitted
+        self.render()
 
     def load(self, path: Path) -> dict:
         xyz, rgb, total = read_ply_points(path)
@@ -263,7 +274,7 @@ class MapViewer:
 
     def render(self) -> None:
         width = max(self.box.get_allocated_width(), 320)
-        height = VIEWER_HEIGHT
+        height = max(self.height, 200)
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         canvas[:, :] = self.BG
         if len(self.points):
@@ -316,7 +327,7 @@ class MapViewer:
             self.pitch = min(1.5, max(-1.5, self.pitch + dy * 0.008))
         else:
             rot = self._rotation()
-            scale = self.dist / (VIEWER_HEIGHT * 1.3)
+            scale = self.dist / (max(self.height, 200) * 1.3)
             right, up = rot.T[:, 0], -rot.T[:, 1]
             self.center = self.center + right * dx * scale - up * dy * scale
         self.render()
@@ -344,8 +355,8 @@ class MapViewer:
         if not len(self.points):
             return
         width = max(self.box.get_allocated_width(), 320)
-        sx, sy, _, ok, _, _ = self._project(width, VIEWER_HEIGHT)
-        cand = ok & (sx >= 0) & (sx < width) & (sy >= 0) & (sy < VIEWER_HEIGHT)
+        sx, sy, _, ok, _, _ = self._project(width, max(self.height, 200))
+        cand = ok & (sx >= 0) & (sx < width) & (sy >= 0) & (sy < max(self.height, 200))
         if not np.any(cand):
             return
         d2 = (sx[cand] - x) ** 2 + (sy[cand] - y) ** 2
@@ -356,6 +367,39 @@ class MapViewer:
         self.render()
         if self.on_change:
             self.on_change()
+
+class MapViewerWindow(Gtk.Window):
+    """A big standalone 3D inspection window (the in-panel viewer stays as a preview)."""
+
+    def __init__(self) -> None:
+        super().__init__(title="3D 點雲檢視")
+        self.set_default_size(1100, 800)
+        self.viewer = MapViewer(expand=True)
+        self.viewer.on_change = self.update_label
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+        self.add(box)
+        hint = css_label("左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪縮放", "hint", wrap=True)
+        box.pack_start(hint, False, False, 0)
+        box.pack_start(self.viewer.box, True, True, 0)
+        row = Gtk.Box(spacing=6)
+        self.label = css_label("", "hint", wrap=True)
+        self.label.set_selectable(True)
+        row.pack_start(self.label, True, True, 0)
+        reset_button = Gtk.Button(label="重設視角")
+        reset_button.connect("clicked", lambda _b: self.viewer.reset_view())
+        row.pack_start(reset_button, False, False, 0)
+        box.pack_start(row, False, False, 0)
+
+    def update_label(self) -> None:
+        self.label.set_text(self.viewer.describe())
+
+    def open_cloud(self, label: str, path: Path) -> None:
+        """Load `path` and bring the window forward; raises on unreadable files."""
+        self.viewer.load(path)
+        self.set_title(f"3D 點雲檢視 — {label}")
+        self.update_label()
+        self.show_all()
+        self.present()
 
 class App(Gtk.Window):
     def __init__(self) -> None:
@@ -610,7 +654,7 @@ class App(Gtk.Window):
         top.pack_end(self.stop_button, False, False, 0)
         box.pack_start(top, False, False, 4)
 
-        box.pack_start(css_label("結果（完成後出現在這裡；點雲檔點兩下直接在上方 3D 檢視開啟，其他檔名點兩下用外部程式開啟）", "step"), False, False, 0)
+        box.pack_start(css_label("結果（完成後出現在這裡；點雲檔點兩下開大視窗檢視，其他檔名點兩下用外部程式開啟）", "step"), False, False, 0)
         self.result_stack = Gtk.Stack()
         self.result_hint = css_label("任務完成後顯示結果", "hint")
         self.result_stack.add_named(self.result_hint, "hint")
@@ -640,6 +684,14 @@ class App(Gtk.Window):
         self.approve_button.set_tooltip_text("在上方 3D 檢視裡轉一轉、確認地圖沒有明顯問題後再按。按了巡航定位才會放行。")
         self.approve_button.connect("clicked", self.approve_current_map)
         approval_row.pack_start(self.approve_button, False, False, 0)
+        self.pack_button = Gtk.Button(label="📦 打包轉接包")
+        self.pack_button.set_tooltip_text("把這張地圖包成可搬到另一台電腦的轉接包；只在這台巡航可以不打")
+        self.pack_button.connect("clicked", self.pack_current_map)
+        approval_row.pack_start(self.pack_button, False, False, 0)
+        big_button = Gtk.Button(label="🔍 大視窗")
+        big_button.set_tooltip_text("用大視窗看目前這份點雲（跟點兩下檔名一樣）")
+        big_button.connect("clicked", lambda _b: self.open_big_viewer())
+        approval_row.pack_start(big_button, False, False, 0)
         reset_button = Gtk.Button(label="重設視角")
         reset_button.set_tooltip_text("回到一開始的整體視角")
         reset_button.connect("clicked", lambda _b: self.viewer.reset_view())
@@ -652,8 +704,11 @@ class App(Gtk.Window):
         map_page.pack_start(file_scroll, True, True, 0)
         self.result_stack.add_named(map_page, "files")
         self.approved_dir = None
+        self.approved_engine = ""
         self.viewer_info = {}
         self.viewer_source = ""
+        self.viewer_path = None
+        self.big_viewer = None
         cruise = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.cruise_summary = Gtk.Label(xalign=0)
         self.coverage_bar = Gtk.ProgressBar(show_text=True)
@@ -890,7 +945,7 @@ class App(Gtk.Window):
         subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def view_result_cloud(self, label: str, path: Path) -> None:
-        """Double-clicked a point cloud row: inspect it in the built-in 3D viewer."""
+        """Double-clicked a point cloud row: inspect it in the 3D viewers."""
         try:
             self.viewer_info = self.viewer.load(path)
         except (OSError, ValueError) as error:
@@ -898,9 +953,28 @@ class App(Gtk.Window):
             subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         self.viewer_source = f"{label}（{path.name}）"
+        self.viewer_path = path
         self.viewer_frame.show_all()
         self.update_viewer_label()
         self.refresh_approval_ui()
+        self.open_big_viewer()
+
+    def open_big_viewer(self) -> None:
+        """Show the current cloud in a big standalone window."""
+        path = getattr(self, "viewer_path", None)
+        if not path or not Path(path).is_file():
+            return
+        label = getattr(self, "viewer_source", "") or Path(path).name
+        if self.big_viewer is None:
+            self.big_viewer = MapViewerWindow()
+            self.big_viewer.connect("destroy", self.on_big_viewer_closed)
+        try:
+            self.big_viewer.open_cloud(label, Path(path))
+        except (OSError, ValueError) as error:
+            self.error(f"大視窗載入失敗：{error}")
+
+    def on_big_viewer_closed(self, _window) -> None:
+        self.big_viewer = None
 
     def on_close(self, *_args) -> bool:
         if jobs.running_count():
@@ -940,7 +1014,7 @@ class App(Gtk.Window):
             self.signature = signature
             self.job_store.clear()
             for j in listing:
-                self.job_store.append([j["id"], "建圖" if j["kind"] == "map" else "巡航", j.get("name", ""), j["engine"],
+                self.job_store.append([j["id"], KIND_NAME.get(j["kind"], j["kind"]), j.get("name", ""), j["engine"],
                                        STATUS.get(j["status"], j["status"]), time.strftime("%m-%d %H:%M:%S", time.localtime(j["created"])),
                                        STATUS_COLOR.get(j["status"], "#24292f")])
             for row in self.job_store:
@@ -1014,7 +1088,7 @@ class App(Gtk.Window):
             self.stage_bar.pulse()
 
     def update_detail(self, job: dict) -> None:
-        self.title_label.set_text(f"{'建圖' if job['kind'] == 'map' else '巡航定位'}：{job.get('name', '')}")
+        self.title_label.set_text(f"{KIND_NAME.get(job['kind'], job['kind'])}：{job.get('name', '')}")
         extra = f"　結束碼 {job['exit_code']}" if job.get("exit_code") is not None else ""
         extra += f"　{GLib.markup_escape_text(job['error'])}" if job.get("error") else ""
         self.status_label.set_markup(f'<span foreground="{STATUS_COLOR.get(job["status"], "#24292f")}" weight="bold">'
@@ -1051,11 +1125,14 @@ class App(Gtk.Window):
     def load_map_viewer(self, job: dict) -> None:
         """Show the 3D inspection + approval bar for a finished map job."""
         self.approved_dir = job.get("result_dir", "")
+        self.approved_engine = job.get("engine", "")
+        self.viewer_path = jobs.map_pointcloud(job)
         ply = jobs.map_pointcloud(job) if job["status"] == "done" else None
         if ply is None:
             self.viewer_frame.hide()
             self.viewer_info = {}
             self.viewer_source = ""
+            self.viewer_path = None
         else:
             try:
                 self.viewer_info = self.viewer.load(ply)
@@ -1083,6 +1160,9 @@ class App(Gtk.Window):
             self.approval_label.set_text("○ 尚未確認：先在上方 3D 檢視檢查地圖（轉一轉、放大看看有沒有明顯破碎或錯位），沒問題再按右邊確認")
             self.approve_button.set_label("✓ 確認地圖可用，可以巡航")
         self.approve_button.set_sensitive(bool(self.viewer_info) or approved)
+        show_pack = (approved and self.approved_engine == "original"
+                     and jobs.map_bundle(self.approved_dir) is None)
+        self.pack_button.set_visible(show_pack)
 
     def approve_current_map(self, _button=None) -> None:
         if not self.approved_dir:
@@ -1097,11 +1177,31 @@ class App(Gtk.Window):
         self.refresh_approval_ui()
         self.refresh_map_choices(force=True)
         self.update_readiness()
+        if (self.approved_engine == "original" and jobs.map_bundle(self.approved_dir) is None
+                and self.ask_pack_now()):
+            self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
+
+    def ask_pack_now(self) -> bool:
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.YES_NO,
+                                   text="地圖已確認可用。要現在打包轉接包嗎？\n（要搬到另一台電腦巡航才需要；在這台用可按否，以後隨時按「📦 打包轉接包」補打）")
+        answer = dialog.run()
+        dialog.destroy()
+        return answer == Gtk.ResponseType.YES
+
+    def pack_current_map(self, _button=None) -> None:
+        if not self.approved_dir or self.approved_engine != "original":
+            return
+        if jobs.map_bundle(self.approved_dir) is not None:
+            return
+        self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
 
     def show_result(self, job: dict | None) -> None:
         self.plot_points = []
         if job is None or job["kind"] != "map":
             self.approved_dir = None
+            self.approved_engine = ""
+            self.viewer_path = None
             self.viewer_frame.hide()
         if job is None:
             self.result_hint.set_text("任務完成後顯示結果")
@@ -1121,6 +1221,20 @@ class App(Gtk.Window):
                 self.result_hint.set_text(hint)
                 self.result_stack.set_visible_child_name("hint")
             self.load_map_viewer(job)
+            return
+        if job["kind"] == "pack":
+            rows = jobs.pack_result(job)
+            self.file_store.clear()
+            for row in rows:
+                self.file_store.append([row["label"], row["path"], row["size"]])
+            if rows:
+                self.result_stack.set_visible_child_name("files")
+            else:
+                hint = ("打包失敗：看上方日誌找原因，修好後按「↻ 續跑」再打一次" if job["status"] == "failed"
+                        else "任務被停止或中斷：沒有產出轉接包" if job["status"] in ("stopped", "interrupted")
+                        else "打包中…（轉接包完成後會列在這裡）")
+                self.result_hint.set_text(hint)
+                self.result_stack.set_visible_child_name("hint")
             return
         data = jobs.cruise_result(job)
         if data is None:

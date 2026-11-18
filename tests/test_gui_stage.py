@@ -153,3 +153,33 @@ def test_read_ply_points_binary_and_ascii(tmp_path: Path) -> None:
         xyz, rgb, total = gui_app.read_ply_points(p)
         assert total == 5 and xyz.shape == (5, 3) and rgb.shape == (5, 3)
         assert abs(xyz[4, 0] - 12.0) < 1e-6 and rgb.dtype.name == "uint8"
+
+
+def test_build_map_original_skips_pack(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    _video(tmp_path / "v", "a.mp4")
+    cmd, _ = jobs.build_map_command(
+        {"engine": "original", "videos": [str(tmp_path / "v")], "name": "n",
+         "out": str(tmp_path / "out"), "intrinsics": "", "skip_dense": False}, "job9")
+    assert "--no-pack" in cmd
+
+
+def test_build_pack_command_layout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    base = tmp_path / "mymap"
+    (base / "run").mkdir(parents=True)
+    cmd, meta = jobs.build_pack_command(base, "job9")
+    assert cmd[1] == "pack" and str(base / "run") in cmd
+    assert cmd[cmd.index("--out") + 1] == str(base)
+    assert meta["result_dir"] == str(base)
+    with pytest.raises(ValueError, match="run 資料夾"):
+        jobs.build_pack_command(tmp_path / "norun", "job9")
+
+
+def test_pack_result_lists_bundle(tmp_path) -> None:
+    assert jobs.pack_result({"result_dir": str(tmp_path)}) == []
+    bundle = tmp_path / "mymap_bundle.tar.zst"
+    bundle.write_bytes(b"x" * 10)
+    rows = jobs.pack_result({"result_dir": str(tmp_path)})
+    assert len(rows) == 1 and rows[0]["path"] == str(bundle)
+    assert jobs.map_bundle(str(tmp_path)) == bundle

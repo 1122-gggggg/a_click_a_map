@@ -369,7 +369,8 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
             staged = stage_selection(videos, job_dir(job_id) / "selection")
         except OSError as error:
             raise ValueError(f"準備影片失敗（硬碟空間或權限）：{error}")
-        cmd = [str(REPO / "run.sh"), "map", str(staged.resolve()), "--out", str(out), "--name", name]
+        cmd = [str(REPO / "run.sh"), "map", str(staged.resolve()), "--out", str(out), "--name", name,
+               "--no-pack"]
         if intrinsics:
             cmd += ["--intrinsics", intrinsics]
         return cmd, {"name": name, "result_dir": str(out / name)}
@@ -382,6 +383,30 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
             cmd.append("--skip-dense")
         return cmd, {"name": name, "result_dir": str(target)}
     raise ValueError("未知引擎")
+
+
+def map_bundle(map_dir: str | Path) -> Path | None:
+    """The packed transfer bundle of a map folder, if the user chose to pack it."""
+    bundles = sorted(Path(map_dir).expanduser().glob("*_bundle.tar.zst"))
+    return bundles[-1] if bundles else None
+
+
+def build_pack_command(map_dir: str | Path, job_id: str) -> tuple[list[str], dict]:
+    """Pack a finished map run into its transfer bundle (runs after user approval)."""
+    base = Path(map_dir).expanduser().resolve()
+    run = base / "run"
+    if not run.is_dir():
+        raise ValueError("找不到這張地圖的 run 資料夾，無法打包")
+    name = f"{base.name}_bundle"
+    cmd = [str(REPO / "run.sh"), "pack", str(run), "--out", str(base), "--name", name]
+    return cmd, {"name": f"{base.name} 打包", "result_dir": str(base)}
+
+
+def pack_result(job: dict) -> list[dict]:
+    bundle = map_bundle(job.get("result_dir", ""))
+    if bundle is None:
+        return []
+    return [{"label": "轉接包（搬到另一台電腦）", "path": str(bundle), "size": human(bundle.stat().st_size)}]
 
 
 def build_cruise_command(request: dict, job_id: str) -> tuple[list[str] | str, dict]:
@@ -455,8 +480,10 @@ def _run(job: dict, cmd: list[str] | str) -> None:
 
 def create_job(request: dict) -> dict:
     kind, engine = request.get("kind"), request.get("engine")
-    if kind not in ("map", "cruise") or engine not in ("original", "moge3"):
+    if kind not in ("map", "cruise", "pack") or engine not in ("original", "moge3"):
         raise ValueError("任務類型或引擎錯誤")
+    if kind == "pack" and engine != "original":
+        raise ValueError("只有原始版需要單獨打包")
     status = engine_status()[engine]
     if not status["ready"]:
         raise ValueError("此引擎尚未安裝：" + status["hint"])
@@ -467,7 +494,12 @@ def create_job(request: dict) -> dict:
         job_dir(job_id).rmdir()
         raise ValueError("找不到可跑引擎的 Python（需 torch＋CUDA、pycolmap、pygluemap）：先跑 setup，或設 ACAM_PYTHON 再重開程式")
     try:
-        cmd, meta = build_map_command(request, job_id) if kind == "map" else build_cruise_command(request, job_id)
+        if kind == "map":
+            cmd, meta = build_map_command(request, job_id)
+        elif kind == "cruise":
+            cmd, meta = build_cruise_command(request, job_id)
+        else:
+            cmd, meta = build_pack_command(request["map"], job_id)
     except ValueError:
         job_dir(job_id).rmdir()
         raise
