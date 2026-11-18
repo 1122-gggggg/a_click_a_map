@@ -112,10 +112,6 @@ if [ -f "$TP/mvsformerpp/weights/model_best.pth" ]; then
     || { echo "SHA256 mismatch for $TP/mvsformerpp/weights/model_best.pth" >&2; exit 1; }
   [ -f "$TP/mvsformerpp/weights/config.json" ] || echo "NOTE: MVSFormer++ config.json missing next to model_best.pth"
 else echo "NOTE: MVSFormer++ weights missing. Put model_best.pth + config.json in $TP/mvsformerpp/weights/ or export ACAM_MVS_CHECKPOINT/ACAM_MVS_CONFIG"; fi
-"$PY" - <<'E' || "$PY" -m pip install tensorboardX
-try:
-    import tensorboardX  # noqa
-except ImportError:
-    raise SystemExit(1)
-E
+# The TNT checkpoint unpickles ConfigParser, which imports easydict.
+"$PY" -m pip install easydict tensorboardX
 echo "next: ./run.sh doctor"

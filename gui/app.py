@@ -860,15 +860,16 @@ class App(Gtk.Window):
         dialog.run()
         dialog.destroy()
 
-    def submit(self, request: dict) -> None:
+    def submit(self, request: dict) -> dict | None:
         try:
             job = jobs.create_job(request)
         except (ValueError, OSError) as error:
             self.error(str(error))
-            return
+            return None
         self.signature = ()
         self.tick()
         self.select(job["id"])
+        return job
 
     def start_map(self, _button=None) -> None:
         self.submit(self.map_request())
@@ -885,7 +886,15 @@ class App(Gtk.Window):
             return
         if job.get("status") not in ("failed", "stopped", "interrupted"):
             return
-        self.submit(jobs.resume_request(job))
+        old_id = job["id"]
+        new = self.submit(jobs.resume_request(job))
+        if new is None:
+            return
+        try:
+            jobs.delete_job(old_id)
+        except (OSError, ValueError) as error:
+            self.error(f"續跑已排入，但無法清除舊任務：{error}")
+        self.tick()
 
     def confirm_delete(self, _button=None) -> None:
         if not self.selected:

@@ -7,8 +7,10 @@ or `third_party/mvsformerpp/weights/{model_best.pth,config.json}` (see `scripts/
 """
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -29,7 +31,6 @@ def sha256_file(path: Path) -> str:
 
 def weights() -> tuple[Path, Path] | None:
     """(checkpoint, config) if the user supplied both MVSFormer++ files."""
-    import os
     ckpt = Path(os.environ.get("ACAM_MVS_CHECKPOINT", WEIGHTS_DIR / "model_best.pth")).expanduser()
     cfg = Path(os.environ.get("ACAM_MVS_CONFIG", WEIGHTS_DIR / "config.json")).expanduser()
     if ckpt.is_file() and cfg.is_file():
@@ -71,6 +72,17 @@ def run_dense(paths, run: Path, *, python: str, mvs_python: str | None = None) -
         except (OSError, ValueError):
             pass
     interpreter = mvs_python or python
+    dependencies = subprocess.run(
+        [interpreter, "-c", "from easydict import EasyDict; import tensorboardX"],
+        env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
+        capture_output=True, text=True,
+    )
+    if dependencies.returncode != 0:
+        raise RuntimeError(
+            f"MVSFormer++ 依賴無法載入（{interpreter}）。請先執行 "
+            f"`{shlex.quote(interpreter)} -m pip install easydict tensorboardX` 再續跑。\n"
+            f"{dependencies.stderr.strip()}"
+        )
     cmd = [interpreter, str(DENSE_STAGE), "--model", str(model), "--images", str(images),
            "--output", str(out), "--checkpoint", str(checkpoint), "--config", str(config),
            "--mvsformerpp-root", str(src), "--mvs-python", interpreter,

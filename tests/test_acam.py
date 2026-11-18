@@ -11,6 +11,29 @@ from acam.config import Paths
 GIB = 2**30
 
 
+def test_dense_reports_missing_checkpoint_dependency(tmp_path: Path, monkeypatch) -> None:
+    import venv
+
+    from acam import dense
+
+    engine = tmp_path / "engine"
+    venv.EnvBuilder().create(engine)
+    source = tmp_path / "mvsformerpp"
+    (source / "datasets").mkdir(parents=True)
+    (source / "utils.py").touch()
+    for env, name in (("ACAM_MVS_CHECKPOINT", "model_best.pth"), ("ACAM_MVS_CONFIG", "config.json")):
+        path = source / name
+        path.touch()
+        monkeypatch.setenv(env, str(path))
+    monkeypatch.setattr(dense, "SOURCE_DIR", source)
+
+    python = str(engine / "bin/python")
+    with pytest.raises(RuntimeError, match=r"No module named 'easydict'") as caught:
+        dense.run_dense(None, tmp_path / "run", python=python)
+    assert f"{python} -m pip install easydict tensorboardX" in str(caught.value)
+    assert not (tmp_path / "run/products/map/dense/work").exists()
+
+
 def test_choose_tracks_reproduces_the_two_measured_corpora() -> None:
     # 2043 images on ~30 GiB: K=1024 OOM-killed, K=512 completed -> must pick 512
     assert plan.choose_tracks(2043, 30 * GIB)[0] == 512

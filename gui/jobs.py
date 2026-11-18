@@ -751,7 +751,7 @@ def delete_job(job_id: str) -> None:
     job = read_job(job_id)
     if job.get("status") not in ("done", "failed", "stopped", "interrupted"):
         raise ValueError("執行中的任務請先按「停止」，不能直接刪除")
-    shutil.rmtree(job_dir(job_id), ignore_errors=True)
+    shutil.rmtree(job_dir(job_id))
 
 
 def stop_all() -> int:
