@@ -4,7 +4,7 @@
     ./gui.sh
 
 操作只有兩條路（二選一），都在左邊分頁：
-    建圖：     ① 加入影片 → ② 取名＋選輸出位置 → ③ 按「開始建圖」
+    建圖：     ① 加入影片 → ② 選相機設定 → ③ 取名＋選輸出位置 → ④ 按「開始建圖」
     巡航定位： ① 選一張已建好的地圖 → ② 選一部巡航影片 → ③ 按「開始巡航定位」
 右邊的任務中心顯示目前進度；成果和執行日誌分開。操作條件不足時，開始按鈕上方會顯示原因。
 建圖完成後，先在 3D 檢視確認地圖沒問題並按下確認，巡航定位才會放行。
@@ -507,7 +507,7 @@ class App(Gtk.Window):
     def _map_page(self) -> tuple[Gtk.Widget, Gtk.Widget]:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
         # --- step 1: videos ---
-        self.map_step1 = css_label("步驟 1／3：加入影片", "step")
+        self.map_step1 = css_label("步驟 1／4：加入影片", "step")
         video_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.video_store = Gtk.ListStore(str)
         self.video_view = Gtk.TreeView(model=self.video_store, headers_visible=False)
@@ -543,20 +543,21 @@ class App(Gtk.Window):
         selection.connect("changed", lambda selected: remove_button.set_sensitive(selected.count_selected_rows() > 0))
         for signal in ("row-inserted", "row-deleted"):
             self.video_store.connect(signal, lambda model, *_: clear_button.set_sensitive(bool(len(model))))
+            self.video_store.connect(signal, self.on_camera_batch_changed)
         video_list.pack_start(row2, False, False, 0)
         self.video_hint = css_label("", "hint", wrap=True)
         video_list.pack_start(self.video_hint, False, False, 0)
         page.pack_start(self._step_frame(self.map_step1, video_list), False, False, 0)
 
-        # --- step 2: settings ---
-        self.map_step2 = css_label("步驟 2／3：取名與輸出位置", "step")
+        page.pack_start(self._camera_section(), False, False, 0)
+
+        # --- step 3: settings ---
+        self.map_step2 = css_label("步驟 3／4：取名與輸出位置", "step")
         settings = Gtk.Grid(column_spacing=8, row_spacing=6)
         self.name = Gtk.Entry(text="site", hexpand=True, width_chars=12)
         self.name.set_tooltip_text("任務名稱：只能用英文、數字、底線；會變成輸出資料夾的名字")
         self.out = Gtk.Entry(text=str(jobs.REPO / "acam_out"), hexpand=True, width_chars=12)
         self.out.set_tooltip_text("建圖結果要放在哪個資料夾")
-        self.intrinsics = Gtk.Entry(hexpand=True, placeholder_text="留空使用預設", width_chars=12)
-        self.intrinsics.set_tooltip_text("相機標定檔（JSON，需含 image_width、image_height 與 3x3 K 矩陣，且為已去畸變影像；沒有就留空；格式與範例見操作說明第 4 節）")
         settings.attach(Gtk.Label(label="任務名稱", xalign=0), 0, 0, 1, 1)
         settings.attach(self.name, 1, 0, 2, 1)
         settings.attach(Gtk.Label(label="輸出位置", xalign=0), 0, 1, 1, 1)
@@ -568,16 +569,10 @@ class App(Gtk.Window):
         self.dense_check.set_tooltip_text("勾選會在建圖後多跑稠密化（需 MVSFormer++ 權重）；不勾只建稀疏地圖，比較快")
         self.dense_check.set_active(True)
         settings_box.pack_start(self.dense_check, False, False, 0)
-        advanced = Gtk.Expander(label="進階設定 · 相機標定")
-        calibration = Gtk.Box(spacing=6, margin_top=6)
-        calibration.pack_start(self.intrinsics, True, True, 0)
-        calibration.pack_end(self.chooser_button(self.intrinsics, "json"), False, False, 0)
-        advanced.add(calibration)
-        settings_box.pack_start(advanced, False, False, 0)
         page.pack_start(self._step_frame(self.map_step2, settings_box), False, False, 0)
 
-        # --- step 3: go ---
-        submit_heading = css_label("步驟 3／3：開始", "step")
+        # --- step 4: go ---
+        submit_heading = css_label("步驟 4／4：開始", "step")
         go = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.start_map_button = Gtk.Button(label="開始建圖")
         for style in ("go", "suggested-action"):
@@ -587,6 +582,20 @@ class App(Gtk.Window):
         go.pack_start(self.map_readiness, False, False, 0)
         go.pack_start(self.start_map_button, False, False, 0)
         return page, self._step_frame(submit_heading, go)
+
+    def _camera_section(self) -> Gtk.Widget:
+        self.calibration_pick = Gtk.ComboBoxText()
+        self.calibration_pick.get_cells()[0].set_property("ellipsize", Pango.EllipsizeMode.END)
+        self.calibration_pick.connect("changed", self.on_camera_batch_changed)
+        row = Gtk.Box(spacing=6)
+        row.pack_start(self.calibration_pick, True, True, 0)
+        add_profile = Gtk.Button(label="匯入 JSON…")
+        add_profile.connect("clicked", self.import_camera)
+        row.pack_start(add_profile, False, False, 0)
+        self.camera_confirm = Gtk.CheckButton(label="同批影片使用同一相機、鏡頭與錄影模式")
+        self.camera_confirm.get_child().set_line_wrap(True)
+        self.camera_note = css_label("", "hint", wrap=True)
+        return self._step_frame(css_label("步驟 2／4：相機設定", "step"), row, self.camera_note, self.camera_confirm)
 
     def _cruise_page(self) -> tuple[Gtk.Widget, Gtk.Widget]:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
@@ -709,6 +718,11 @@ class App(Gtk.Window):
         self.transfer_hint.set_selectable(True)
         self.transfer_hint.set_no_show_all(True)
         box.pack_start(self.transfer_hint, False, False, 0)
+        self.calibration_warn = css_label(
+            "相機內參為自動估算（未驗證）。不要只憑點雲外觀判定定位準確；請用獨立影片驗證。",
+            "warn", "readiness", wrap=True)
+        self.calibration_warn.set_no_show_all(True)
+        box.pack_start(self.calibration_warn, False, False, 0)
         self.result_stack = Gtk.Stack()
         self.result_hint = css_label("選擇任務後，這裡會顯示可用成果。", "hint", wrap=True)
         self.result_hint.set_valign(Gtk.Align.START)
@@ -830,6 +844,11 @@ class App(Gtk.Window):
         return button
 
     def choose(self, entry: Gtk.Entry, kind: str) -> None:
+        path = self.choose_path(kind, entry.get_text().strip())
+        if path:
+            entry.set_text(path)
+
+    def choose_path(self, kind: str, current: str = "") -> str | None:
         action = Gtk.FileChooserAction.SELECT_FOLDER if kind == "folder" else Gtk.FileChooserAction.OPEN
         dialog = Gtk.FileChooserDialog(title="請選擇", parent=self, action=action)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "選擇", Gtk.ResponseType.OK)
@@ -843,13 +862,50 @@ class App(Gtk.Window):
         elif kind == "json":
             flt.set_name("JSON")
             flt.add_pattern("*.json")
+            flt.add_pattern("*.JSON")
             dialog.add_filter(flt)
-        current = entry.get_text().strip()
         if current and Path(current).expanduser().exists():
             dialog.set_filename(str(Path(current).expanduser()))
-        if dialog.run() == Gtk.ResponseType.OK:
-            entry.set_text(dialog.get_filename())
+        path = dialog.get_filename() if dialog.run() == Gtk.ResponseType.OK else None
         dialog.destroy()
+        return path
+
+    def import_camera(self, _button: Gtk.Button) -> None:
+        path = self.choose_path("json")
+        if path is None:
+            return
+        try:
+            profile = jobs.import_camera_profile(Path(path))
+        except (OSError, ValueError) as error:
+            self.error(f"無法匯入相機設定：{error}")
+            return
+        self.refresh_camera_choices(str(profile))
+        self.update_readiness()
+
+    def refresh_camera_choices(self, selected: str = "") -> None:
+        combo = self.calibration_pick
+        combo.remove_all()
+        combo.append("", "選擇相機設定…")
+        combo.append(str(jobs.BUILTIN_CAMERA_PROFILE), "內建預設 · Parrot ANAFI（1280×720）")
+        for path in sorted(jobs.camera_profiles_dir().glob("*.json")):
+            combo.append(str(path), path.stem)
+        if self.engine == "moge3":
+            combo.append("auto", "自動估算（未驗證）")
+        if not combo.set_active_id(selected):
+            combo.set_active(0)
+
+    def on_camera_batch_changed(self, *_args) -> None:
+        self.camera_confirm.set_active(False)
+        selected = self.calibration_pick.get_active_id()
+        if selected == "auto":
+            text = "只供試建；不會驗證內參。影片須已去畸變，正式使用前需驗證定位。"
+        elif selected == str(jobs.BUILTIN_CAMERA_PROFILE):
+            text = "沿用目前河濱資料的 ANAFI 標定。請確認是相同錄影模式；只支援等比例縮放。"
+        elif selected:
+            text = "使用所選 JSON 的無畸變 PINHOLE 內參；請確認它對應這批影片的錄影模式。"
+        else:
+            text = "選擇或匯入標定檔。不同相機、裁切或錄影模式請分批建圖。"
+        self.camera_note.set_text(text)
 
     def add_video_entry(self, path: str) -> None:
         if path and path not in [row[0] for row in self.video_store]:
@@ -894,9 +950,9 @@ class App(Gtk.Window):
             if radio.get_active() != (key == self.engine):
                 radio.set_active(key == self.engine)
         original = self.engine == "original"
+        self.refresh_camera_choices(self.calibration_pick.get_active_id() or "")
         if hasattr(self, "engine_hint"):
-            self.engine_hint.set_text("原始版：一次一批（同批需同長寬比），輸出轉接包；巡航要另外給查詢影片" if original
-                                      else "MoGe-3 版：可一次加入多個資料夾或影片檔")
+            self.engine_hint.set_text("原始版：必須選擇相機標定" if original else "MoGe-3：可選相機標定或自動估算")
         # 兩個版本都能隨意混搭資料夾與單檔；原始版會在開始時自動拼成一個資料夾
         self.add_files_button.set_sensitive(True)
         self.video_hint.set_text("可混搭多個資料夾與影片檔，會自動找出裡面的影片" + ("（同批需同長寬比）" if original else ""))
@@ -933,9 +989,13 @@ class App(Gtk.Window):
 
     # ------------------------------------------------------------------------------------------ readiness
     def map_request(self) -> dict:
+        profile = self.calibration_pick.get_active_id()
         return {"kind": "map", "engine": self.engine, "name": self.name.get_text(),
                 "videos": [row[0] for row in self.video_store], "out": self.out.get_text(),
-                "intrinsics": self.intrinsics.get_text(), "dense": self.dense_check.get_active()}
+                "intrinsics": profile if profile and profile != "auto" else "",
+                "camera_profile": self.calibration_pick.get_active_text() if profile else "",
+                "camera_confirmed": self.camera_confirm.get_active(),
+                "auto_calibrate": profile == "auto", "dense": self.dense_check.get_active()}
 
     def cruise_request(self) -> dict:
         return {"kind": "cruise", "engine": self.engine, "map": self.map_dir.get_text(),
@@ -953,7 +1013,7 @@ class App(Gtk.Window):
         if not hasattr(self, "start_map_button"):
             return
         videos = [row[0] for row in self.video_store]
-        self.map_step1.set_text(f"步驟 1／3：加入影片（已選 {len(videos)} 項）")
+        self.map_step1.set_text(f"步驟 1／4：加入影片（已選 {len(videos)} 項）")
         self.map_step1.get_style_context().remove_class("step-done")
         self.map_step1.get_style_context().remove_class("step")
         self.map_step1.get_style_context().add_class("step-done" if videos else "step")
@@ -1411,6 +1471,8 @@ class App(Gtk.Window):
         self.plot_points = []
         self.transfer_hint.hide()
         self.connect_warn.hide()
+        self.calibration_warn.set_visible(bool(job and job["kind"] == "map" and job["engine"] == "moge3"
+                                               and jobs.uses_approximate_calibration(job)))
         if job is None or job["kind"] != "map":
             self.approved_dir = None
             self.approved_engine = ""

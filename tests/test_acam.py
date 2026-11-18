@@ -84,9 +84,13 @@ def test_video_components_flag_a_disconnected_video() -> None:
     assert report.video_components(shared, ["a", "b", "c", "d"], 1) == [["a", "b", "c", "d"]]
 
 
-def test_default_command_is_map() -> None:
-    parser_args = cli.build_parser().parse_args(["map", "/videos", "--tracks", "384"])
-    assert parser_args.tracks == "384" and parser_args.out == Path("acam_out")
+def test_map_requires_explicit_calibration(capsys) -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["map", "/videos", "--tracks", "384"])
+    assert error.value.code == 2 and "--intrinsics" in capsys.readouterr().err
+    args = parser.parse_args(["map", "/videos", "--tracks", "384", "--intrinsics", "camera.json"])
+    assert args.intrinsics == Path("camera.json") and args.tracks == "384" and args.out == Path("acam_out")
     assert cli.safe_name("烏來 建圖/2026") == "2026"
     assert cli.safe_name("a b") == "a_b"
 

@@ -7,7 +7,7 @@ Corpus: three 40 s clips cut from one 2688x1512 video (`P1240124`, 60-100 s, 90-
 10 s overlaps), run as
 
 ```
-./run.sh videos/ --out out --name smoke --query query_d.MP4
+./run.sh videos/ --intrinsics configs/river_intrinsics_undistorted.json --out out --name smoke --query query_d.MP4
 ```
 
 | step | result |

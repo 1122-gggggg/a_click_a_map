@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # MoGe-3 entry point: videos -> sparse RGB PLY + MVSFormer++ dense PLY + EDM/MegaLoc localization bundle.
-#   ./run_moge3.sh VIDEO [VIDEO ...] --output OUT [--intrinsics K.json | --auto_calibrate] [--skip-dense]
+#   ./run_moge3.sh VIDEO [VIDEO ...] --output OUT (--intrinsics K.json | --auto_calibrate) [--skip-dense]
 # One-time setup: moge3/scripts/setup.sh   (see moge3/README.md). The original entry point is ./run.sh.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

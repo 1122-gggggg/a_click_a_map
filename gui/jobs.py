@@ -22,6 +22,10 @@ import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from acam.calibration import load_calibration  # noqa: E402
+
+BUILTIN_CAMERA_PROFILE = REPO / "configs/river_intrinsics_undistorted.json"
 JOBS = REPO / "acam_gui" / "jobs"
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mts"}
 LOCK = threading.Lock()
@@ -505,6 +509,59 @@ def map_output_status(out_raw: str, name_raw: str) -> str | None:
     return None
 
 
+def camera_profiles_dir() -> Path:
+    home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return home / "a_click_a_map" / "cameras"
+
+
+def import_camera_profile(source: Path) -> Path:
+    """Save a local copy without changing any profile already used by another job."""
+    profile = load_calibration(source)
+    directory = camera_profiles_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{safe_name(source.stem, 'camera')}.json"
+    try:
+        with target.open("x", encoding="utf-8") as stream:
+            json.dump(profile, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    except FileExistsError:
+        if load_calibration(target) != profile:
+            raise ValueError("已有同名但內容不同的相機設定，請先重新命名來源 JSON")
+    return target
+
+
+def _camera_choice(request: dict) -> Path | None:
+    """Return the selected file, or None only for an explicit MoGe-3 opt-in."""
+    engine = request.get("engine")
+    raw = (request.get("intrinsics") or "").strip()
+    if request.get("auto_calibrate") is True:
+        if engine != "moge3" or raw:
+            raise ValueError("只有 MoGe-3 可單獨選擇自動估算，不可同時指定標定檔")
+        path = None
+    elif raw:
+        path = Path(raw).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"找不到標定檔：{path}")
+    else:
+        message = "請在「相機設定」選擇或匯入標定；原始版不會自動標定" if engine == "original" else "請選擇相機設定或明確選擇自動估算"
+        raise ValueError(message)
+    if not request.get("_resume") and request.get("camera_confirmed") is not True:
+        raise ValueError("請確認同批影片使用同一相機、鏡頭與錄影模式；否則請分批建圖")
+    return path
+
+
+def uses_approximate_calibration(job: dict) -> bool:
+    base = Path(job["result_dir"])
+    for receipt in (base / "map/map_receipt.json", base / "pipeline_receipt.json"):
+        try:
+            data = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(source := data.get("calibration_source"), str):
+            return source.startswith("APPROXIMATE_")
+    return False
+
+
 def validate_map_request(request: dict) -> tuple[bool, str]:
     """Lightweight pre-flight check for the 建圖 form: (ready, reason).
 
@@ -519,28 +576,21 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
         return False, "任務名稱不能空白"
     if not (request.get("out") or "").strip():
         return False, "輸出位置不能空白"
-    intrinsics = (request.get("intrinsics") or "").strip()
-    if intrinsics and not Path(intrinsics).expanduser().is_file():
-        return False, f"找不到標定檔：{intrinsics}"
+    if engine not in ("original", "moge3"):
+        return False, "未知的建圖方式"
     taken = map_output_status(request.get("out"), request.get("name"))
     if taken:
         return False, taken
-    if engine == "original":
-        try:
-            count = sum(1 for _ in expand_videos(entries))
-        except ValueError as error:
-            return False, str(error)
-        if request.get("dense") and mvs_weights() is None:
-            return False, "缺 MVSFormer++ 權重：把 model_best.pth 與 config.json 放到 third_party/mvsformerpp/weights/（或設 ACAM_MVS_CHECKPOINT／ACAM_MVS_CONFIG），或取消勾選「包含稠密點雲」"
-        extra = "＋稠密點雲" if request.get("dense") else ""
-        return True, f"就緒：共 {count} 部影片{extra}，按「開始建圖」（同批影片需同長寬比）"
-    if engine == "moge3":
-        try:
-            count = sum(1 for _ in expand_videos(entries))
-        except ValueError as error:
-            return False, str(error)
-        return True, f"就緒：共 {count} 部影片，按「開始建圖」"
-    return False, "未知的建圖方式"
+    try:
+        count = len(expand_videos(entries))
+        path = _camera_choice(request)
+    except (OSError, ValueError) as error:
+        return False, str(error)
+    if engine == "original" and request.get("dense") and mvs_weights() is None:
+        return False, "缺 MVSFormer++ 權重：請先安裝權重，或取消「產生稠密點雲」"
+    camera = "自動估算（未驗證）" if path is None else request.get("camera_profile") or path.stem
+    extra = "＋稠密點雲" if request.get("dense") else ""
+    return True, f"就緒：共 {count} 部影片{extra} · {camera}"
 
 
 def mvs_weights() -> tuple[Path, Path] | None:
@@ -607,15 +657,28 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
         raise ValueError("請加入影片")
     name = safe_name(request.get("name") or "site", "site")
     out = Path(request.get("out") or REPO / "acam_out").expanduser().resolve()
-    intrinsics = (request.get("intrinsics") or "").strip()
-    if intrinsics and not Path(intrinsics).expanduser().is_file():
-        raise ValueError(f"找不到標定檔: {intrinsics}")
     if not request.get("_resume"):
         taken = map_output_status(str(out), name)
         if taken:
             raise ValueError(taken)
+    if engine not in ("original", "moge3"):
+        raise ValueError("未知引擎")
+    videos = expand_videos(entries)
+    path = _camera_choice(request)
+    meta = {"name": name, "result_dir": str(out / name)}
+    if path is not None:
+        try:
+            payload = load_calibration(path)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"標定檔無效：{error}") from error
+        snapshot = job_dir(job_id) / "intrinsics.json"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        meta["calibration_file"] = str(snapshot.resolve())
+        calibration_args = ["--intrinsics", meta["calibration_file"]]
+    else:
+        calibration_args = ["--auto_calibrate"]
     if engine == "original":
-        videos = expand_videos(entries)
         try:
             staged = stage_selection(videos, job_dir(job_id) / "selection")
         except OSError as error:
@@ -624,18 +687,11 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
                "--no-pack"]
         if request.get("dense"):
             cmd += ["--dense"]
-        if intrinsics:
-            cmd += ["--intrinsics", intrinsics]
-        return cmd, {"name": name, "result_dir": str(out / name)}
-    if engine == "moge3":
-        videos = expand_videos(entries)
-        target = out / name
-        cmd = [str(REPO / "run_moge3.sh"), *[str(v.resolve()) for v in videos], "--output", str(target)]
-        cmd += ["--intrinsics", intrinsics] if intrinsics else ["--auto_calibrate"]
+    else:
+        cmd = [str(REPO / "run_moge3.sh"), *[str(v.resolve()) for v in videos], "--output", meta["result_dir"]]
         if not request.get("dense", True):
             cmd.append("--skip-dense")
-        return cmd, {"name": name, "result_dir": str(target)}
-    raise ValueError("未知引擎")
+    return [*cmd, *calibration_args], meta
 
 
 def map_bundle(map_dir: str | Path) -> Path | None:
@@ -753,6 +809,19 @@ def resume_request(job: dict) -> dict:
     request = dict(job.get("request", {}))
     request.update(kind=job.get("kind"), engine=job.get("engine"))
     request["_resume"] = True  # same out/name on purpose: continue from stage caches
+    if request.get("kind") == "map":
+        if snapshot := job.get("calibration_file"):
+            request["intrinsics"] = snapshot
+        elif "auto_calibrate" not in request:
+            # Preserve the original settings of records made before explicit camera choice.
+            if job.get("engine") == "original":
+                stored = Path(job.get("result_dir") or "") / "acam/intrinsics.json"
+                if job.get("result_dir") and stored.is_file():
+                    request["intrinsics"] = str(stored)
+                elif not request.get("intrinsics"):
+                    request["intrinsics"] = str(BUILTIN_CAMERA_PROFILE)
+            elif not request.get("intrinsics"):
+                request["auto_calibrate"] = True
     return request
 
 def resume_plan(job: dict) -> list[tuple[str, str]]:
@@ -839,12 +908,14 @@ def create_job(request: dict) -> dict:
             cmd, meta = _build_export_command(request["map"])
         else:
             cmd, meta = build_pack_command(request["map"], job_id)
-    except ValueError:
-        job_dir(job_id).rmdir()
+    except (OSError, ValueError):
+        shutil.rmtree(job_dir(job_id))
         raise
     job = {"id": job_id, "kind": kind, "engine": engine, "status": "queued", "created": time.time(), **meta,
            "engine_python": engine_python,
-           "request": {k: v for k, v in request.items() if k in ("videos", "out", "name", "intrinsics", "video", "map", "route", "dense")}}
+           "request": {k: v for k, v in request.items() if k in (
+               "videos", "out", "name", "intrinsics", "video", "map", "route", "dense",
+               "camera_profile", "camera_confirmed", "auto_calibrate")}}
     write_job(job)
     threading.Thread(target=_run, args=(job, cmd), daemon=True).start()
     return job

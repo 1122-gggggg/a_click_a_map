@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gui"))
 
 import jobs
 
+CAMERA = {"intrinsics": str(jobs.BUILTIN_CAMERA_PROFILE), "camera_confirmed": True}
+
 
 def _video(directory: Path, name: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
@@ -37,7 +39,7 @@ def test_build_map_original_stages_mixed_entries(tmp_path: Path, monkeypatch) ->
     two = _video(tmp_path / "elsewhere", "two.mp4")
     cmd, meta = jobs.build_map_command(
         {"engine": "original", "videos": [str(folder), str(two)], "name": "n",
-         "out": str(tmp_path / "out"), "intrinsics": "", "skip_dense": False}, "job1")
+         "out": str(tmp_path / "out"), **CAMERA}, "job1")
     selection = Path(cmd[2])
     assert selection.parent.name == "job1"
     assert sorted(p.name for p in selection.iterdir()) == ["one.mp4", "two.mp4"]
@@ -64,7 +66,7 @@ def test_validate_original_counts_videos_not_entries(tmp_path: Path) -> None:
     _video(tmp_path, "c.mp4")
     ok, message = jobs.validate_map_request(
         {"engine": "original", "videos": [str(tmp_path / "d1"), str(tmp_path / "c.mp4")],
-         "name": "n", "out": str(tmp_path), "intrinsics": ""})
+         "name": "n", "out": str(tmp_path), **CAMERA})
     assert ok and "共 3 部影片" in message
 
 
@@ -157,7 +159,7 @@ def test_build_map_original_skips_pack(tmp_path, monkeypatch) -> None:
     _video(tmp_path / "v", "a.mp4")
     cmd, _ = jobs.build_map_command(
         {"engine": "original", "videos": [str(tmp_path / "v")], "name": "n",
-         "out": str(tmp_path / "out"), "intrinsics": "", "skip_dense": False}, "job9")
+         "out": str(tmp_path / "out"), **CAMERA}, "job9")
     assert "--no-pack" in cmd
 
 
@@ -219,7 +221,7 @@ def test_build_map_original_dense_flag(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
     _video(tmp_path / "v", "a.mp4")
     base = {"engine": "original", "videos": [str(tmp_path / "v")], "name": "n",
-            "out": str(tmp_path / "out"), "intrinsics": "", "skip_dense": False}
+            "out": str(tmp_path / "out"), **CAMERA}
     cmd, _ = jobs.build_map_command({**base, "dense": True}, "job1")
     assert "--dense" in cmd
     cmd, _ = jobs.build_map_command({**base}, "job9")
@@ -230,8 +232,9 @@ def test_moge3_dense_defaults_on(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
     _video(tmp_path / "v", "a.mp4")
     base = {"engine": "moge3", "videos": [str(tmp_path / "v")], "name": "n",
-            "out": str(tmp_path / "out"), "intrinsics": ""}
+            "out": str(tmp_path / "out"), "camera_confirmed": True, "auto_calibrate": True}
     cmd, _ = jobs.build_map_command(base, "job1")
+    assert "--auto_calibrate" in cmd
     assert "--skip-dense" not in cmd
     cmd, _ = jobs.build_map_command({**base, "dense": False}, "job2")
     assert "--skip-dense" in cmd
@@ -243,7 +246,7 @@ def test_dense_readiness_needs_weights(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(jobs, "REPO", tmp_path / "repo")
     _video(tmp_path, "a.mp4")
     req = {"engine": "original", "videos": [str(tmp_path / "a.mp4")], "name": "n",
-           "out": str(tmp_path), "intrinsics": "", "dense": True}
+           "out": str(tmp_path), "dense": True, **CAMERA}
     ok, message = jobs.validate_map_request(req)
     assert not ok and "MVSFormer++" in message
     (tmp_path / "repo/third_party/mvsformerpp/weights").mkdir(parents=True)
@@ -331,6 +334,68 @@ def test_same_name_fresh_task_blocked_but_resume_passes(tmp_path, monkeypatch) -
     monkeypatch.setattr(jobs, "stage_selection", lambda videos, dest: dest)
     _cmd, meta = jobs.build_map_command(resumed, "job2")
     assert meta["result_dir"] == str(_P(str(tmp_path / "out")) / "dup")
+
+
+def test_camera_choice_requires_explicit_mode_and_matching_batch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    video = _video(tmp_path, "clip.mp4")
+    base = {"engine": "original", "videos": [str(video)], "name": "new", "out": str(tmp_path / "out")}
+    ready, reason = jobs.validate_map_request(base)
+    assert not ready and "原始版不會自動標定" in reason
+    with pytest.raises(ValueError, match="原始版不會自動標定"):
+        jobs.build_map_command(base, "noCamera")
+    with pytest.raises(ValueError, match="分批建圖"):
+        jobs.build_map_command({**base, **CAMERA, "camera_confirmed": False}, "mixed")
+    with pytest.raises(ValueError, match="只有 MoGe-3"):
+        jobs.build_map_command({**base, "camera_confirmed": True, "auto_calibrate": True}, "invalid")
+    with pytest.raises(ValueError, match="明確選擇"):
+        jobs.build_map_command({**base, "engine": "moge3", "camera_confirmed": True}, "noAuto")
+    assert not jobs.JOBS.exists()
+
+
+def test_camera_profile_import_and_resume_use_job_snapshot(tmp_path, monkeypatch) -> None:
+    import json
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    video = _video(tmp_path, "clip.mp4")
+    calibration = jobs.load_calibration(jobs.BUILTIN_CAMERA_PROFILE)
+    source = tmp_path / "camera-mode.json"
+    source.write_text(json.dumps(calibration))
+    saved = jobs.import_camera_profile(source)
+    request = {"kind": "map", "engine": "original", "videos": [str(video)], "name": "new",
+               "out": str(tmp_path / "out"), "intrinsics": str(saved), "camera_confirmed": True}
+    cmd, meta = jobs.build_map_command(request, "old")
+    assert cmd[cmd.index("--intrinsics") + 1] == meta["calibration_file"]
+    changed = jobs.load_calibration(saved)
+    changed["K"][0][0] += 100
+    source.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="同名"):
+        jobs.import_camera_profile(source)
+    assert jobs.load_calibration(saved) == calibration
+
+    saved.unlink()
+    resumed = jobs.resume_request({**meta, "kind": "map", "engine": "original", "request": request})
+    cmd, resumed_meta = jobs.build_map_command(resumed, "new")
+    assert resumed_meta["result_dir"] == meta["result_dir"]
+    assert Path(cmd[cmd.index("--intrinsics") + 1]).parent.name == "new"
+    assert jobs.load_calibration(Path(resumed_meta["calibration_file"])) == calibration
+
+
+def test_bad_calibration_is_not_imported_or_staged(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    profile = tmp_path / "invalid.json"
+    profile.write_text('{"image_width": 1280, "image_height": 720, "images_are_undistorted": false}')
+    with pytest.raises(ValueError, match="undistort the footage"):
+        jobs.import_camera_profile(profile)
+    video = _video(tmp_path, "clip.mp4")
+    request = {"engine": "original", "videos": [str(video)], "out": str(tmp_path / "out"),
+               "intrinsics": str(profile), "camera_confirmed": True}
+    with pytest.raises(ValueError, match="標定檔無效"):
+        jobs.build_map_command(request, "invalid")
+    assert not jobs.camera_profiles_dir().exists()
+    assert not jobs.JOBS.exists()
 
 
 def test_measured_spkf_prefers_history(tmp_path) -> None:

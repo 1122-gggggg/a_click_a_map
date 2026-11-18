@@ -30,13 +30,12 @@ EDM 沿用 `patches/edm.patch`，MVSFormer++ 套用 `patches/mvsformerpp-sdpa.pa
 ## 使用
 
 ```bash
-./run_moge3.sh a.mp4 b.mp4 c.mp4 --output OUT                 # 影片可為檔案或資料夾
+./run_moge3.sh a.mp4 b.mp4 c.mp4 --output OUT --auto_calibrate  # 明確選擇未驗證的估算
 ./run_moge3.sh videos/ --output OUT --intrinsics K.json        # 已知相機（建議）
 ```
 
 `K.json`：`{"image_width":W,"image_height":H,"K":[[fx,0,cx],[0,fy,cy],[0,0,1]],"images_are_undistorted":true}`。
-未提供時用 `--auto_calibrate`（初始焦距 1.2×max(W,H)，BA 精修，收據標為 `APPROXIMATE_AUTO_CALIBRATE`）。
-影片必須已去畸變（或相機鏡頭畸變可忽略）。
+不提供標定檔時必須明確加 `--auto_calibrate`（初始焦距 1.2×max(W,H)，BA 精修）；收據標記 `APPROXIMATE_AUTO_CALIBRATE`、`UNVERIFIED_ESTIMATE`。影片須已去畸變，且同批使用同一相機與錄影模式。
 
 | 產出 | 路徑 |
 |---|---|

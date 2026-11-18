@@ -12,12 +12,12 @@ import time
 from pathlib import Path
 
 from . import __version__, plan, runner
+from .calibration import load_calibration
 from .config import REPO, Paths, load_paths
 from .hw import GIB, free_bytes, gpu, read_meminfo, scope_available
 from .report import to_markdown
 from .videos import aspect_mismatches, find_videos, probe
 
-DEFAULT_INTRINSICS = REPO / "configs/river_intrinsics_undistorted.json"
 COMMANDS = {"map", "doctor", "pack", "localize", "setup", "export-site"}
 MIN_AVAILABLE_GIB = 10
 
@@ -105,15 +105,23 @@ def cmd_map(args: argparse.Namespace) -> int:
         return 2
     name = safe_name(args.name or source.name)
     base = out / name
-    base.mkdir(parents=True, exist_ok=True)
     meta = base / "acam"
+    intrinsics_src = args.intrinsics.expanduser().resolve()
+    stored_calibration = meta / "intrinsics.json"
+    try:
+        calibration = load_calibration(intrinsics_src)
+        if stored_calibration.is_file() and load_calibration(stored_calibration) != calibration:
+            say(f"camera calibration differs from the saved calibration in {base}; use a new run name")
+            return 2
+    except (OSError, ValueError) as error:
+        say(f"invalid camera calibration: {error}")
+        return 2
     meta.mkdir(parents=True, exist_ok=True)
-    intrinsics_src = (args.intrinsics or DEFAULT_INTRINSICS).expanduser().resolve()
-    calibration = json.loads(intrinsics_src.read_text(encoding="utf-8"))
     mem = read_meminfo()
     sources = {v.name: v for v in videos}
 
     say(f"a_click_a_map {__version__}: {len(videos)} video(s) in {source}")
+    say(f"  calibration: supplied PINHOLE {calibration['image_width']}x{calibration['image_height']} ({intrinsics_src})")
     if not args.skip_checks:
         rows = doctor(paths)
         blockers = [(n, d) for n, ok, d in rows if not ok and not n.startswith("memory cgroup")]
@@ -147,7 +155,7 @@ def cmd_map(args: argparse.Namespace) -> int:
     if bad:
         say("these videos do not match the calibration's aspect ratio "
             f"({calibration['image_width']}x{calibration['image_height']}): " + ", ".join(v.path.name for v in bad))
-        say("one run supports one calibrated camera group; give --intrinsics for that camera or split the folder")
+        say("use one camera and recording mode per run; split mixed footage and supply its matching --intrinsics")
         return 2
     keep = [v.name for v in videos if v.name not in excluded]
     if not keep:
@@ -180,7 +188,8 @@ def cmd_map(args: argparse.Namespace) -> int:
 
     job = runner.MapJob(site=safe_name(name), corpus=base / "corpus", run=base / "run", workspace=base / "workspace",
                         meta=meta, intrinsics=meta / "intrinsics.json")
-    job.intrinsics.write_text(json.dumps(calibration, indent=2) + "\n", encoding="utf-8")
+    if not stored_calibration.is_file():
+        stored_calibration.write_text(json.dumps(calibration, indent=2) + "\n", encoding="utf-8")
 
     if runner.finished(job.run):
         say(f"mapping already finished in {job.run}; skipping to report/pack")
@@ -323,7 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("videos", type=Path, help="folder with the videos (one calibrated camera group)")
     m.add_argument("--out", type=Path, default=Path("acam_out"))
     m.add_argument("--name", help="run name (default: video folder name)")
-    m.add_argument("--intrinsics", type=Path, help="undistorted PINHOLE calibration JSON (default: River camera)")
+    m.add_argument("--intrinsics", required=True, type=Path, help="undistorted PINHOLE calibration JSON for this camera mode")
     m.add_argument("--tracks", default="auto", help="num_track_per_img: 'auto' (RAM-based) or an integer 256..1024")
     m.add_argument("--max-attempts", type=int, default=3)
     m.add_argument("--max-keyframes", type=int, help="hard cap on keyframes (default: from this machine's RAM)")

@@ -49,9 +49,9 @@ def main() -> None:
     ap.add_argument("videos", nargs="+", help="mapping videos / image dirs")
     ap.add_argument("--output", required=True)
     ap.add_argument("--toolkit", default=None, help="toolkit root containing repo/ resources/ weights/ envs/")
-    cal = ap.add_mutually_exclusive_group()
+    cal = ap.add_mutually_exclusive_group(required=True)
     cal.add_argument("--intrinsics", default=None, help="undistorted PINHOLE calibration JSON (recommended)")
-    cal.add_argument("--auto_calibrate", action="store_true", help="video-only approximate calibration (default)")
+    cal.add_argument("--auto_calibrate", action="store_true", help="explicitly use approximate, unverified calibration")
     ap.add_argument("--gluemap-python", default=None)
     ap.add_argument("--moge-python", default=None)
     ap.add_argument("--mvs-python", default=None)
@@ -98,6 +98,19 @@ def main() -> None:
         cmd += args.map_arg
         step("1/3 mapping", cmd, env)
     else:
+        source = json.loads((map_dir / "map_receipt.json").read_text())["calibration_source"]
+        if args.intrinsics:
+            from mapping.calibration import load_calibration
+
+            seed = json.loads((map_dir / "intrinsics.json").read_text())
+            seed = seed.get("seed_calibration", seed)
+            expected = load_calibration(args.intrinsics).as_dict()
+            same_calibration = source == expected["calibration_source"] and all(
+                seed.get(key) == value for key, value in expected.items())
+        else:
+            same_calibration = source == "APPROXIMATE_AUTO_CALIBRATE"
+        if not same_calibration:
+            sys.exit("error: calibration differs from the existing map; choose a new --output")
         print("1/3 mapping: receipt present, skipped")
 
     if not args.skip_dense:
@@ -127,6 +140,7 @@ def main() -> None:
     else:
         print("3/3 localization bundle: receipt present, skipped")
 
+    calibration_source = json.loads((map_dir / "map_receipt.json").read_text())["calibration_source"]
     receipt = {
         "schema": "portable-pipeline/v1",
         "sparse_rgb_ply": str(map_dir / "sparse_rgb.ply"),
@@ -135,7 +149,8 @@ def main() -> None:
         "localization_bundle": str(loc_dir / "bundle"),
         "coordinate_frame": "all three outputs share the map_stage COLMAP world frame (identity transform)",
         "scale": "monocular map: arbitrary unit (up to Sim3), NOT metric",
-        "calibration_source": json.loads((map_dir / "map_receipt.json").read_text())["calibration_source"],
+        "calibration_source": calibration_source,
+        "calibration_status": "UNVERIFIED_ESTIMATE" if calibration_source.startswith("APPROXIMATE_") else "SUPPLIED",
         "python": py,
     }
     (out / "pipeline_receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
