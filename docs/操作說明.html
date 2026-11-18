@@ -70,7 +70,7 @@ code { background: #f6f8fa; padding: 1px 5px; border-radius: 3px; font-size: 10p
   </ul></li>
   <li><b>安裝引擎</b>（約 30～60 分鐘，需連網，會下載約 8 GB 的模型權重）：<br><code>cd a_click_a_map</code><br><code>./scripts/setup.sh</code><br>MoGe-3 版（稀疏＋稠密點雲）另外執行 <code>moge3/scripts/setup.sh</code>，細節見《工程人員安裝說明》。注意：EDM 定位權重（<code>edm_outdoor.ckpt</code>）不會自動下載，請向工程人員索取並放到 <code>third_party/EDM/weights/</code>。</li>
   <li><b>檢查環境</b>：<br><code>./run.sh doctor</code><br>每一行都要是 <code>[ok]</code> 才算安裝成功。有紅字請看《工程人員安裝說明》第 6 節，或把整段文字給工程人員。</li>
-  <li><b>放桌面捷徑</b>（一次就好）：<br><code>./安裝桌面捷徑.sh</code><br>若圖示顯示成文字檔，在它上面按右鍵選「允許啟動」。</li>
+  <li><b>放桌面捷徑</b>（一次就好）：<br><code>./安裝桌面捷徑.sh</code><br>裝完桌面會出現圖示。若圖示顯示成文字檔，在它上面按右鍵選「允許啟動」。<br>若桌面沒出現圖示：登出再登入一次；或按 Super 鍵（Windows 鍵）搜尋「無人機」，從應用程式啟動也一樣。</li>
   <li><b>開啟程式</b>：在桌面<b>連按兩下</b>「無人機自動建圖巡航系統」圖示，看到主畫面（圖 1）就可以從第 4 節開始建圖。</li>
 </ol>
 <div class="box"><b class="t">第一次試跑建議</b>先用兩支各 20 秒的短影片建圖（約 6 分鐘），確認整條路會通，再跑正式的大場景。短片試跑成功後，之後的操作都不需要再碰終端機。</div>
