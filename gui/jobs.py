@@ -78,12 +78,12 @@ def engine_status() -> dict[str, dict]:
     tk = toolkit()
     return {
         "moge3": {
-            "label": "MoGe-3 版（稀疏點雲 + MVSFormer++ 稠密 + 定位包）",
+            "label": "MoGe-3 版（稀疏＋稠密點雲＋定位包）",
             "ready": (tk / "envs/gluemap/bin/python").exists() and (tk / "weights").is_dir(),
             "hint": "先執行 moge3/scripts/setup.sh",
         },
         "original": {
-            "label": "原始版（EDM + KLT，輸入影片資料夾）",
+            "label": "原始版（一次一個影片資料夾）",
             "ready": (REPO / "run.sh").exists() and (REPO / "third_party").is_dir(),
             "hint": "先執行 ./run.sh setup",
         },
