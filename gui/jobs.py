@@ -8,6 +8,7 @@ Engines:
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import shlex
@@ -136,6 +137,45 @@ def reset_engine_python_cache() -> None:
     """Forget the cached probe (tests only)."""
     global _ENGINE_PYTHON, _ENGINE_PYTHON_CHECKED
     _ENGINE_PYTHON, _ENGINE_PYTHON_CHECKED = None, False
+
+STAGES = (("screening", "篩選"), ("preprocessing", "前處理"), ("mapping", "建圖"),
+          ("report", "報告"), ("packing", "打包"))
+_TQDM = re.compile(r"(\d+)%\|[^\r\n]*? (\d+)/(\d+) \[([0-9:.]+)<([0-9:.]+)")
+_STAGE_MARK = re.compile(r"\[([0-4])/4\]")
+_ETA_HINT = re.compile(r"~([0-9.]+ h)")
+
+
+def parse_progress(log_text: str) -> dict:
+    """Turn the tail of a job log into a progress summary for the GUI.
+
+    Returns stage checklist state, the last tqdm-style counter (if any),
+    and the mapping time estimate printed by the engine. Pure function.
+    """
+    marks = [int(m) for m in _STAGE_MARK.findall(log_text)]
+    stage = max(marks) if marks else None
+    tqdm = _TQDM.findall(log_text.replace("\r", "\n"))
+    percent = done = total = elapsed = remaining = None
+    if tqdm:
+        percent, done, total, elapsed, remaining = tqdm[-1]
+        percent, done, total = int(percent), int(done), int(total)
+    estimate = None
+    hint = _ETA_HINT.search(log_text)
+    if hint:
+        estimate = hint.group(1)
+    return {"stage": stage, "percent": percent, "done": done, "total": total,
+            "elapsed": elapsed, "remaining": remaining, "estimate": estimate}
+
+
+def read_log_tail(job_id: str, size: int = 50000) -> str:
+    """Last `size` bytes of a job log (cheap to call every second)."""
+    path = job_dir(job_id) / "log.txt"
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - size))
+            return stream.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 def loc_python() -> str:
     return os.environ.get("LOC_PYTHON") or str(toolkit() / "envs/gluemap/bin/python")

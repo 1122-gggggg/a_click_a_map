@@ -93,3 +93,24 @@ def test_find_engine_python_none_when_nothing_works(tmp_path, monkeypatch) -> No
         assert jobs.find_engine_python() is None
     finally:
         jobs.reset_engine_python_cache()
+
+
+def test_parse_progress_stages_and_tqdm() -> None:
+    log = ("a_click_a_map 0.1.0: 2 video(s)\n"
+           "[0/4] screening videos\n  OK a.mp4\n"
+           "[1/4] preprocessing: hashing\n"
+           "[2/4] mapping: GlueMap poses -> EDM (~0.1 h; memory-guarded)\n"
+           "  0%|          | 0/57 [00:00<?, ?it/s]\r"
+           " 56%|###     | 32/57 [00:31<00:24, 2.15it/s]\r")
+    info = jobs.parse_progress(log)
+    assert info["stage"] == 2
+    assert (info["percent"], info["done"], info["total"]) == (56, 32, 57)
+    assert info["remaining"] == "00:24"
+    assert info["estimate"] == "0.1 h"
+
+
+def test_parse_progress_empty_and_done() -> None:
+    assert jobs.parse_progress("")["stage"] is None
+    assert jobs.parse_progress("starting...\n")["percent"] is None
+    info = jobs.parse_progress("[0/4] x\n[1/4] y\n[2/4] z\n[3/4] r\n[4/4] p\ndone\n")
+    assert info["stage"] == 4

@@ -584,10 +584,13 @@ class App(Gtk.Window):
         self.title_label.get_style_context().add_class("step")
         self.status_label = Gtk.Label(xalign=0, use_markup=True)
         self.elapsed_label = css_label("", "hint")
+        self.stage_label = Gtk.Label(xalign=0, use_markup=True)
+        self.stage_bar = Gtk.ProgressBar(show_text=True)
+        self.stage_bar.set_no_show_all(True)
         self.path_label = css_label("", "hint")
         self.path_label.set_selectable(True)
         self.path_label.set_line_wrap(True)
-        for widget in (self.title_label, self.status_label, self.elapsed_label, self.path_label):
+        for widget in (self.title_label, self.status_label, self.elapsed_label, self.stage_label, self.stage_bar, self.path_label):
             info.pack_start(widget, False, False, 0)
         top.pack_start(info, True, True, 0)
         self.stop_button = Gtk.Button(label="■ 停止")
@@ -915,6 +918,67 @@ class App(Gtk.Window):
             self.update_detail(job)
         return True
 
+    def update_stage(self, job: dict) -> None:
+        """Show which build step is running plus the in-step counter and ETA."""
+        if job["kind"] != "map" or job["status"] == "queued":
+            if job["kind"] == "map":
+                self.stage_label.set_text("")
+                self.stage_bar.hide()
+                return
+            if job["status"] != "running":
+                self.stage_label.set_text("")
+                self.stage_bar.hide()
+                return
+            info = jobs.parse_progress(jobs.read_log_tail(job["id"]))
+            self.stage_bar.show()
+            if info["percent"] is not None and info["total"]:
+                self.stage_bar.set_fraction(info["done"] / info["total"])
+                self.stage_bar.set_text(f"{info['done']}/{info['total']}　約剩 {info['remaining']}")
+                self.stage_label.set_text(f"定位中：{info['done']}/{info['total']}（約剩 {info['remaining']}）")
+            else:
+                self.stage_bar.set_fraction(0.0)
+                self.stage_bar.set_text("定位中…")
+                self.stage_bar.pulse()
+                self.stage_label.set_text("定位中…")
+            return
+        info = jobs.parse_progress(jobs.read_log_tail(job["id"]))
+        stage = info["stage"]
+        if job["status"] in ("done", "failed", "stopped", "interrupted"):
+            if job["status"] == "done":
+                marks = " → ".join(f"✓ {name}" for _, name in jobs.STAGES)
+                self.stage_label.set_markup(f'<span foreground="#1a7f37">{marks}</span>')
+                self.stage_bar.show()
+                self.stage_bar.set_fraction(1.0)
+                self.stage_bar.set_text("全部完成")
+            else:
+                where = jobs.STAGES[stage][1] if stage is not None else "開始前"
+                self.stage_label.set_text(f"停在「{where}」")
+                self.stage_bar.hide()
+            return
+        parts = []
+        for index, (_, name) in enumerate(jobs.STAGES):
+            if stage is not None and index < stage:
+                parts.append(f"✓ {name}")
+            elif stage is not None and index == stage:
+                parts.append(f"▶ {name}")
+            else:
+                parts.append(f"○ {name}")
+        self.stage_label.set_text(" → ".join(parts))
+        self.stage_bar.show()
+        if info["percent"] is not None and info["total"]:
+            self.stage_bar.set_fraction(info["done"] / info["total"])
+            current = jobs.STAGES[stage][1] if stage is not None else ""
+            text = f"{current} {info['done']}/{info['total']}"
+            if info["remaining"]:
+                text += f"　約剩 {info['remaining']}"
+            self.stage_bar.set_text(text)
+        else:
+            current = jobs.STAGES[stage][1] if stage is not None else "準備中"
+            extra = f"（整體約 {info['estimate']}）" if info["estimate"] and (stage or 0) <= 2 else ""
+            self.stage_bar.set_fraction(0.0)
+            self.stage_bar.set_text(f"{current}進行中…{extra}")
+            self.stage_bar.pulse()
+
     def update_detail(self, job: dict) -> None:
         self.title_label.set_text(f"{'建圖' if job['kind'] == 'map' else '巡航定位'}：{job.get('name', '')}")
         extra = f"　結束碼 {job['exit_code']}" if job.get("exit_code") is not None else ""
@@ -927,6 +991,7 @@ class App(Gtk.Window):
         self.elapsed_label.set_text(f"{verb} {format_duration(end - start)}"
                                     + ("　（執行中：看下方日誌確認還活著）" if job["status"] == "running" else ""))
         self.path_label.set_text(job.get("result_dir", ""))
+        self.update_stage(job)
         self.stop_button.set_sensitive(job["status"] == "running")
         self.open_button.set_sensitive(Path(job.get("result_dir", "")).exists())
         chunk, self.log_offset = jobs.read_log(job["id"], self.log_offset)
