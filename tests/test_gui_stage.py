@@ -113,7 +113,7 @@ def test_parse_progress_empty_and_done() -> None:
     assert jobs.parse_progress("")["stage"] is None
     assert jobs.parse_progress("starting...\n")["percent"] is None
     info = jobs.parse_progress("[0/4] x\n[1/4] y\n[2/4] z\n[3/4] r\n[4/4] p\ndone\n")
-    assert info["stage"] == 4
+    assert info["stage"] == 5
 
 
 def test_resume_request_rebuilds_submit() -> None:

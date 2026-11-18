@@ -209,9 +209,10 @@ def reset_engine_python_cache() -> None:
     _ENGINE_PYTHON, _ENGINE_PYTHON_CHECKED = None, False
 
 STAGES = (("screening", "篩選"), ("preprocessing", "前處理"), ("mapping", "建圖"),
-          ("report", "報告"), ("packing", "打包"))
+          ("densification", "稠密化"), ("report", "報告"), ("packing", "打包"))
 _TQDM = re.compile(r"(\d+)%\|[^\r\n]*? (\d+)/(\d+) \[([0-9:.]+)<([0-9:.]+)")
 _STAGE_MARK = re.compile(r"\[([0-4])/4\]")
+_DENSE_MARK = re.compile(r"===\s*densification", re.IGNORECASE)
 _ETA_HINT = re.compile(r"~([0-9.]+ h)")
 
 
@@ -221,8 +222,11 @@ def parse_progress(log_text: str) -> dict:
     Returns stage checklist state, the last tqdm-style counter (if any),
     and the mapping time estimate printed by the engine. Pure function.
     """
-    marks = [int(m) for m in _STAGE_MARK.findall(log_text)]
-    stage = max(marks) if marks else None
+    # [N/4] markers map to stages 0,1,2,4,5; a densification banner means stage 3.
+    events = [(m.start(), {0: 0, 1: 1, 2: 2, 3: 4, 4: 5}[int(m.group(1))])
+              for m in _STAGE_MARK.finditer(log_text)]
+    events += [(m.start(), 3) for m in _DENSE_MARK.finditer(log_text)]
+    stage = max(events, key=lambda e: e[0])[1] if events else None
     tqdm = _TQDM.findall(log_text.replace("\r", "\n"))
     percent = done = total = elapsed = remaining = None
     if tqdm:
@@ -470,6 +474,59 @@ def build_pack_command(map_dir: str | Path, job_id: str) -> tuple[list[str], dic
     name = f"{base.name}_bundle"
     cmd = [str(REPO / "run.sh"), "pack", str(run), "--out", str(base), "--name", name]
     return cmd, {"name": f"{base.name} 打包", "result_dir": str(base)}
+
+
+def _dir_size(root: Path) -> tuple[int, int]:
+    total, count = 0, 0
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                try:
+                    total += path.stat().st_size
+                    count += 1
+                except OSError:
+                    pass
+    return total, count
+
+
+def pack_preview(map_dir: str | Path) -> list[dict]:
+    """What `run.sh pack` is about to put in the bundle, grouped for confirmation.
+
+    Mirrors acam/pack.py's file selection (kept in sync by hand; the builder
+    itself is the authority at pack time). Keyframe JPEGs are summarized by
+    count instead of listed one by one.
+    """
+    base = Path(map_dir).expanduser().resolve()
+    run = base / "run"
+    rows: list[dict] = []
+
+    def add(label: str, paths: list[Path]) -> None:
+        files = [p for p in paths if p.is_file()]
+        if not files:
+            return
+        rows.append({"label": label, "path": str(files[0].parent), "size": human(sum(p.stat().st_size for p in files)),
+                     "detail": f"{len(files)} 個檔案"})
+
+    model = run / "artifacts/mapping/edm/model"
+    add("定位用地圖（COLMAP）", [model / n for n in ("cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin")])
+    glue_size, glue_count = _dir_size(run / "artifacts/mapping/direct/model")
+    if glue_count:
+        rows.append({"label": "建圖原始模型（稠密化輸入用）", "path": str(run / "artifacts/mapping/direct/model"),
+                     "size": human(glue_size), "detail": f"{glue_count} 個檔案"})
+    keyframes = run / "artifacts/keyframes/images"
+    kf_size, kf_count = _dir_size(keyframes)
+    if kf_count:
+        rows.append({"label": "關鍵影格 JPEG（定位比對用）", "path": str(keyframes), "size": human(kf_size), "detail": f"{kf_count} 張"})
+    add("檢索 bank＋定位設定", [run / "products/localization/megaloc_references.npy",
+                              run / "products/localization/megaloc_references.names.json",
+                              run / "products/localization/reference_manifest.jsonl",
+                              run / "products/localization/localizer_config.json",
+                              run / "products/map/original_rgb.ply"])
+    dense = run / "products/map/dense"
+    if (dense / "dense.ply").is_file():
+        size, _ = _dir_size(dense)
+        rows.append({"label": "稠密點雲", "path": str(dense / "dense.ply"), "size": human(size), "detail": "MVSFormer++"})
+    return rows
 
 
 def pack_result(job: dict) -> list[dict]:

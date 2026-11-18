@@ -54,6 +54,7 @@ class _Wheel:
     def __init__(self, direction: int, delta_y: float = 0.0) -> None:
         self.direction = direction
         self.delta_y = delta_y
+        self.x, self.y = 400.0, 150.0  # screen centre: anchor shift is zero
 
 
 def test_zoom_stays_near_robust_scale_despite_outliers() -> None:
@@ -75,3 +76,53 @@ def test_zoom_stays_near_robust_scale_despite_outliers() -> None:
     assert viewer.dist >= viewer.fit_span * 0.05 * 0.999
     assert viewer.dist < 1000.0
     assert viewer.render_calls
+
+
+class _FakeEvent:
+    def __init__(self, direction: int, x: float, y: float, delta_y: float = 0.0) -> None:
+        self.direction = direction
+        self.x = x
+        self.y = y
+        self.delta_y = delta_y
+
+
+def _viewer_with_points(n: int = 3000, seed: int = 1):
+    import sys
+    import types
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gui"))
+    import jobs
+    src = (Path(__file__).resolve().parents[1] / "gui" / "app.py").read_text(encoding="utf-8")
+    up, down, smooth, left = 0, 1, 2, 3
+    ns = {"np": np, "jobs": jobs,
+          "Gdk": types.SimpleNamespace(ScrollDirection=types.SimpleNamespace(UP=up, DOWN=down, SMOOTH=smooth, LEFT=left)),
+          "GdkPixbuf": types.SimpleNamespace(), "Gtk": types.SimpleNamespace(), "GLib": types.SimpleNamespace(),
+          "VIEWER_HEIGHT": 300, "Path": Path}
+    exec(src[src.index("class MapViewer:"):src.index("class MapViewerWindow")], ns)
+    viewer = ns["MapViewer"].__new__(ns["MapViewer"])
+    rng = np.random.default_rng(seed)
+    viewer.points = rng.normal([0, 0, 50], 8, (n, 3))
+    viewer.colors = np.zeros((n, 3), dtype=np.uint8)
+    viewer.total, viewer.yaw, viewer.pitch, viewer.dist = n, 0.6, 0.3, 40.0
+    viewer.span = np.array([30.0, 30.0, 30.0])
+    viewer.fit_span, viewer.outlier_ratio, viewer.height = 30.0, 0.0, 300
+    viewer.drag_button, viewer.last, viewer.on_change = 0, (0.0, 0.0), None
+    viewer.center = np.array([0.0, 0.0, 50.0])
+    viewer.box = types.SimpleNamespace(get_allocated_width=lambda: 800)
+    viewer.render_calls = []
+    viewer.render = lambda: viewer.render_calls.append(1)
+    return viewer, (up, down, smooth, left)
+
+
+def test_wheel_zoom_anchors_cursor() -> None:
+    viewer, (up, down, smooth, left) = _viewer_with_points()
+    W, H = 800, 300
+    sx, sy, _, ok = viewer._project(W, H)[:4]
+    inside = ok & (sx >= 0) & (sx < W) & (sy >= 0) & (sy < H)
+    idx = int(np.flatnonzero(inside)[len(np.flatnonzero(inside)) // 3])
+    ex, ey = float(sx[idx]), float(sy[idx])
+    assert viewer.on_scroll(None, _FakeEvent(up, ex, ey)) is True
+    assert viewer.on_scroll(None, _FakeEvent(up, ex, ey)) is True
+    sx2, sy2, _, ok2 = viewer._project(W, H)[:4]
+    assert ok2[idx]
+    assert abs(float(sx2[idx]) - ex) <= 1 and abs(float(sy2[idx]) - ey) <= 1
+    assert viewer.on_scroll(None, _FakeEvent(left, ex, ey)) is False

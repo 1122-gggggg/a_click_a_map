@@ -291,8 +291,10 @@ class MapViewer:
         return True
 
     def on_scroll(self, _w, event) -> bool:
+        # CloudCompare-style dolly: zoom toward the cursor, not the screen centre.
         if not len(self.points):
             return False
+        old = self.dist
         if event.direction == Gdk.ScrollDirection.UP:
             self.dist /= 1.15
         elif event.direction == Gdk.ScrollDirection.DOWN:
@@ -303,6 +305,15 @@ class MapViewer:
             return False
         span = float(getattr(self, "fit_span", 0.0) or 0.0) or float(self.span.max())
         self.dist = min(max(self.dist, span * 0.05), span * 30.0)
+        if self.dist != old and old > 0:
+            width = max(self.box.get_allocated_width(), 320)
+            height = max(self.height, 200)
+            focal = height * 1.3
+            rot = self._rotation()
+            shift = (old - self.dist) / focal
+            right, up = rot.T[:, 0], -rot.T[:, 1]
+            self.center = (self.center + right * float(event.x - width / 2.0) * shift
+                           + up * float(event.y - height / 2.0) * shift)
         self.render()
         return True
 
@@ -333,7 +344,7 @@ class MapViewerWindow(Gtk.Window):
         self.viewer.on_change = self.update_label
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
         self.add(box)
-        hint = css_label("左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪縮放", "hint", wrap=True)
+        hint = css_label("左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪以游標為中心縮放", "hint", wrap=True)
         box.pack_start(hint, False, False, 0)
         box.pack_start(self.viewer.box, True, True, 0)
         row = Gtk.Box(spacing=6)
@@ -625,7 +636,7 @@ class App(Gtk.Window):
             files.append_column(column)
         files.connect("row-activated", self.open_result_row)
         map_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.viewer_frame = Gtk.Frame(label=" 3D 檢查：左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪縮放 ")
+        self.viewer_frame = Gtk.Frame(label=" 3D 檢查：左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪以游標為中心縮放 ")
         viewer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=6)
         self.viewer = MapViewer()
         self.viewer.on_change = self.update_viewer_label
@@ -1156,9 +1167,17 @@ class App(Gtk.Window):
             self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
 
     def ask_pack_now(self) -> bool:
+        rows = jobs.pack_preview(self.approved_dir)
+        if not rows:
+            self.error("找不到可打包的檔案（地圖輸出不完整），請檢查建圖結果。")
+            return False
+        lines = "\n".join(f"• {r['label']}：{r['size']}（{r.get('detail', '')}）" for r in rows)
         dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
                                    buttons=Gtk.ButtonsType.YES_NO,
-                                   text="地圖已確認可用。要現在打包轉接包嗎？\n（要搬到另一台電腦巡航才需要；在這台用可按否，以後隨時按「📦 打包轉接包」補打）")
+                                   text="地圖已確認可用。要現在打包轉接包嗎？\n\n" + lines + "\n\n"
+                                        "另外會附上：定位程式、安裝腳本、MegaLoc 權重。\n"
+                                        "EDM 定位權重不會打包（另一台電腦需自備，放好再定位）。\n"
+                                        "只在這台巡航可按否，以後隨時按「📦 打包轉接包」補打。")
         answer = dialog.run()
         dialog.destroy()
         return answer == Gtk.ResponseType.YES
@@ -1168,7 +1187,8 @@ class App(Gtk.Window):
             return
         if jobs.map_bundle(self.approved_dir) is not None:
             return
-        self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
+        if self.ask_pack_now():
+            self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
 
     def show_result(self, job: dict | None) -> None:
         self.plot_points = []
