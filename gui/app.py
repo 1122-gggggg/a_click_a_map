@@ -487,7 +487,7 @@ class App(Gtk.Window):
         self.out = Gtk.Entry(text=str(jobs.REPO / "acam_out"), hexpand=True)
         self.out.set_tooltip_text("建圖結果要放在哪個資料夾")
         self.intrinsics = Gtk.Entry(hexpand=True, placeholder_text="留空使用預設")
-        self.intrinsics.set_tooltip_text("相機標定檔（無畸變 PINHOLE JSON）。沒有的話，MoGe-3 版會自動估計；原始版只能用預設相機。")
+        self.intrinsics.set_tooltip_text("相機標定檔（JSON，需含 image_width、image_height 與 3x3 K 矩陣，且為已去畸變影像；沒有就留空；格式與範例見操作說明第 4 節）")
         settings.attach(Gtk.Label(label="任務名稱", xalign=0), 0, 0, 1, 1)
         settings.attach(self.name, 1, 0, 2, 1)
         settings.attach(Gtk.Label(label="輸出位置", xalign=0), 0, 1, 1, 1)

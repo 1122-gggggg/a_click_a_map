@@ -135,7 +135,18 @@ code { background: #f6f8fa; padding: 1px 5px; border-radius: 3px; font-size: 10p
   <tr><th style="width:22%">欄位</th><th>怎麼填</th></tr>
   <tr><td>任務名稱</td><td>為這張地圖取個名字，例如「烏來1031」。之後選地圖時就靠這個名字辨認。</td></tr>
   <tr><td>輸出位置</td><td>地圖要存到哪個資料夾。按「選擇…」挑一個空間足夠的位置。同一個名稱會存在「輸出位置」底下的同名資料夾。</td></tr>
-  <tr><td>相機標定檔</td><td><b>不用填</b>（留空，系統會自動估計相機參數）。只有工程人員特別提供標定檔時才需要選。</td></tr>
+  <tr><td>相機標定檔</td><td><b>沒有就留空</b>（MoGe-3 版會自動估計；原始版用預設相機）。有標定檔才選：必須是 <b>JSON</b>，內容是這台相機在某個解析度下的內參，且影片要是<b>已經去除畸變</b>的（例如關掉魚眼、或先做好去畸變）。<br>
+  檔案長這樣（數字是範例，請換成你這台相機的真實值，單位都是<b>像素</b>）：<br>
+  <pre style="background:#f6f8fa;padding:8px;overflow-x:auto;font-size:10pt;">{
+  "image_width": 1280,
+  "image_height": 720,
+  "K": [[fx, 0, cx],
+        [0, fy, cy],
+        [0, 0, 1]],
+  "images_are_undistorted": true
+}</pre>
+  <code>fx、fy</code> 是橫／縱向焦距，<code>cx、cy</code> 是畫面中心點，<code>image_width／height</code> 是標定時的解析度（跟影片同長寬比即可，系統會等比換算）。<br>
+  不知道這些數字？三種做法：① 問相機廠商要內參；② 請工程人員拿標定板幫這台相機標定一次；③ 直接留空先跑，定位覆蓋率太低再補。</td></tr>
   <tr><td>略過稠密化</td><td><b>建議不要勾選</b>。勾選會比較快，但不會產生稠密點雲。</td></tr>
 </table>
 <h3>③ 開始建圖</h3>
