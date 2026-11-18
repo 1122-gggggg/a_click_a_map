@@ -359,6 +359,7 @@ class App(Gtk.Window):
         self.log_offset = 0
         self.shown: tuple[str, str] | None = None
         self.signature: tuple = ()
+        self.last_status: dict[str, str] = {}
         self.plot_points: list = []
         self.plot_width = 0
         self.plot_span = ""
@@ -893,8 +894,7 @@ class App(Gtk.Window):
         try:
             self.viewer_info = self.viewer.load(path)
         except (OSError, ValueError) as error:
-            self.viewer_label.set_text(f"3D 檢視載入失敗（{path.name}）：{error}，改用外部程式開啟")
-            subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.viewer_label.set_text(f"3D 檢視載入失敗（{path.name}）：{error}")
             return
         self.viewer_source = f"{label}（{path.name}）"
         self.viewer_path = path
@@ -902,6 +902,20 @@ class App(Gtk.Window):
         self.update_viewer_label()
         self.refresh_approval_ui()
         self.open_big_viewer()
+
+    def auto_show_cloud(self, job: dict) -> None:
+        """A map job just finished while we watched: pop open its 3D cloud."""
+        ply = jobs.map_pointcloud(job)
+        if ply is None:
+            return
+        label = f"定位用地圖（{ply.name}）"
+        if self.big_viewer is None:
+            self.big_viewer = MapViewerWindow()
+            self.big_viewer.connect("destroy", self.on_big_viewer_closed)
+        try:
+            self.big_viewer.open_cloud(label, ply)
+        except (OSError, ValueError) as error:
+            self.error(f"3D 檢視載入失敗（{ply.name}）：{error}")
 
     def open_big_viewer(self) -> None:
         """Show the current cloud in a big standalone window."""
@@ -966,6 +980,11 @@ class App(Gtk.Window):
                     self.job_view.get_selection().select_iter(row.iter)
             self.refresh_map_choices()
         job = next((j for j in listing if j["id"] == self.selected), None) if self.selected else None
+        for j in listing:
+            previous = self.last_status.get(j["id"])
+            self.last_status[j["id"]] = j["status"]
+            if (previous in ("queued", "running") and j["status"] == "done" and j["kind"] == "map"):
+                self.auto_show_cloud(j)
         if job:
             self.update_detail(job)
         return True
