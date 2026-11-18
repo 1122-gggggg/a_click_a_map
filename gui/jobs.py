@@ -603,24 +603,39 @@ def _descendants(pid: int) -> list[int]:
     return found
 
 
+def _proc_state(pid: int) -> str | None:
+    """Process state from /proc, or None if reaped already (Z counts as dead)."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[2]
+    except (OSError, IndexError):
+        return None
+
+
 def _kill_tree(pid: int, timeout: float = 10.0) -> None:
-    """SIGTERM the group, then any escaped descendants; SIGKILL stragglers."""
+    """SIGTERM the group, then every known descendant by PID; SIGKILL stragglers.
+
+    The descendant list is snapshotted *before* killing: once the parent dies,
+    orphans are reparented away and a ppid walk can no longer find them.
+    """
+    me = os.getpid()
+    targets = [pid] + [p for p in _descendants(pid) if p != me]
     try:
         os.killpg(pid, signal.SIGTERM)
     except OSError:
         pass
+    for p in targets[1:]:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
     deadline = time.time() + timeout
     while time.time() < deadline:
-        rest = [p for p in _descendants(pid) if p != os.getpid() and _process_alive(p)]
-        if not _process_alive(pid) and not rest:
+        if all(_proc_state(p) in (None, "Z") for p in targets if p != me):
             return
-        for p in rest:
-            try:
-                os.kill(p, signal.SIGTERM)
-            except OSError:
-                pass
         time.sleep(0.5)
-    for p in [pid, *_descendants(pid)]:
+    for p in targets:
+        if p == me:
+            continue
         try:
             os.kill(-p if p == pid else p, signal.SIGKILL)
         except OSError:
