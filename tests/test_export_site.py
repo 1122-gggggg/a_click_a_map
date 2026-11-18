@@ -179,12 +179,12 @@ def test_export_matches_delivery_tree_with_optional_dense(tmp_path: Path) -> Non
 def test_failed_export_does_not_leave_a_partial_delivery(tmp_path: Path) -> None:
     out = tmp_path / "delivery"
     ids = {"site_id": "retry", "display_name": "Retry", "release_id": "retry_v1"}
-    too_small = _synthetic_run(tmp_path / "small", n_images=20, n_points=10)
-    with pytest.raises(ValueError, match="at least 100 registered images"):
-        export.export_site(too_small, out, **ids)
+    ambiguous = _synthetic_run(tmp_path / "ambiguous", n_images=1, n_points=10)
+    with pytest.raises(ValueError, match="do not determine a unique gravity axis"):
+        export.export_site(ambiguous, out, **ids)
     assert not list(out.iterdir())
 
-    valid = _synthetic_run(tmp_path / "valid", n_images=120, n_points=20)
+    valid = _synthetic_run(tmp_path / "valid", n_images=20, n_points=20)
     site = export.export_site(valid, out, **ids)
     assert (site / "site_profile.json").is_file()
     with pytest.raises(FileExistsError, match="site folder already exists"):

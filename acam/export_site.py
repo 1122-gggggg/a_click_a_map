@@ -173,13 +173,14 @@ def write_map_ply(points_xyz: np.ndarray, points_rgb: np.ndarray, path: Path,
 
 def derive_gravity_alignment(rotations: np.ndarray) -> tuple[np.ndarray, dict]:
     """Gravity-from-poses measurement (same math as wulai's derive_map_gravity)."""
-    if len(rotations) < 100:
-        raise ValueError(f"need at least 100 registered images to measure gravity alignment, got {len(rotations)} "
-                         "(the localization side requires map_align; map more footage)")
     right = rotations[:, 0]
     down = rotations[:, 1]
     scatter = np.einsum("ni,nj->ij", right, right)
     eigenvalues, eigenvectors = np.linalg.eigh(scatter)
+    # Without a unique smallest eigenvalue the right axes do not determine
+    # a gravity direction, even if one arbitrary solution has zero residual.
+    if eigenvalues[1] - eigenvalues[0] <= np.finfo(scatter.dtype).eps * eigenvalues[-1]:
+        raise ValueError("camera orientations do not determine a unique gravity axis; capture more varied headings")
     gravity = eigenvectors[:, 0] / np.linalg.norm(eigenvectors[:, 0])
     agreement = float(np.mean(down @ gravity))
     if agreement < 0.0:
