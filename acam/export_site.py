@@ -404,7 +404,11 @@ def export_site(run: Path, out: Path, *, site_id: str, display_name: str, releas
         "site_id": site_id,
         "display_name": display_name,
         "localizer": "direct",
-        "localizer_deploy_dir": "../../../../../定位演算法/deploy_code/sfm_direct_deploy",
+        # Installed sites live at <workspace>/地圖檔/場域/<site_id>/, i.e. three
+        # levels below the repo root, so the deploy dir is three ups. (The
+        # 建圖端輸出規格 example shows five ups, which matches the release
+        # builder's staging layout, not the importer's managed layout.)
+        "localizer_deploy_dir": "../../../定位演算法/deploy_code/sfm_direct_deploy",
         "localizer_profile": "localization/direct_localizer_profile.json",
         "map_reference_poses": "localization/reference_poses.json",
         "map_align": "localization/T_align_gravity.json",
