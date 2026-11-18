@@ -233,7 +233,17 @@ def cmd_map(args: argparse.Namespace) -> int:
         mapping = runner.run_map(paths, job, tracks=tracks, scale=scale, max_attempts=args.max_attempts)
         mapping.update(minutes=round((time.time() - started) / 60, 1), sampling_scale=scale)
         (meta / "mapping_summary.json").write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
-
+    if args.dense:
+        say("=== densification (MVSFormer++) ===")
+        from .dense import run_dense
+        try:
+            dense_summary = run_dense(paths, job.run, python=str(paths.python))
+        except (ValueError, RuntimeError, OSError) as error:
+            say(f"densification failed: {error}")
+            return 6
+        say(f"      dense cloud: {dense_summary.get('dense_ply')} "
+            f"({dense_summary.get('points', 0):,} points, {dense_summary.get('seconds', 0):.0f}s"
+            f"{', resumed' if dense_summary.get('skipped') else ''})")
     say("[3/4] report: registration and cross-video connectivity")
     report_path = base / "map_report.json"
     result = subprocess.run([str(paths.python), "-m", "acam.report", str(job.run), "--out", str(report_path)],
@@ -317,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--force", action="store_true", help="start even if little RAM is available right now")
     m.add_argument("--query", type=Path, action="append", help="query video to localize afterwards (repeatable)")
     m.add_argument("--no-pack", action="store_true")
+    m.add_argument("--dense", action="store_true", help="MVSFormer++ densification after EDM (needs its weights, see setup)")
     m.add_argument("--no-megaloc-weights", action="store_true", help="leave MegaLoc weights out of the bundle")
     m.add_argument("--dry-run", action="store_true", help="preprocess and plan only")
     m.add_argument("--skip-checks", action="store_true")

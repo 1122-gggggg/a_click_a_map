@@ -515,8 +515,10 @@ class App(Gtk.Window):
         settings.attach(self.chooser_button(self.intrinsics, "json"), 2, 2, 1, 1)
         settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         settings_box.pack_start(settings, False, False, 0)
-        self.skip_dense = Gtk.CheckButton(label="略過稠密化（比較快，但不產生稠密點雲；只有 MoGe-3 版有效）")
-        settings_box.pack_start(self.skip_dense, False, False, 0)
+        self.dense_check = Gtk.CheckButton(label="包含稠密點雲（MVSFormer++，較慢但模型更完整）")
+        self.dense_check.set_tooltip_text("勾選會在建圖後多跑稠密化（需 MVSFormer++ 權重）；不勾只建稀疏地圖，比較快")
+        self.dense_check.set_active(True)
+        settings_box.pack_start(self.dense_check, False, False, 0)
         page.pack_start(self._step_frame(self.map_step2, settings_box), False, False, 0)
 
         # --- step 3: go ---
@@ -795,7 +797,6 @@ class App(Gtk.Window):
         # 兩個版本都能隨意混搭資料夾與單檔；原始版會在開始時自動拼成一個資料夾
         self.add_files_button.set_sensitive(True)
         self.video_hint.set_text("可混搭多個資料夾與影片檔，會自動找出裡面的影片" + ("（同批需同長寬比）" if original else ""))
-        self.skip_dense.set_sensitive(not original)
         self.map_pick_hint.set_text(("原始版：選含 run/ 的資料夾" if original else "MoGe-3 版：選含 localization/bundle 的資料夾")
                                     + "；巡航前需先在建圖結果按「✓ 確認地圖可用」")
         self.refresh_map_choices(force=True)
@@ -825,7 +826,7 @@ class App(Gtk.Window):
     def map_request(self) -> dict:
         return {"kind": "map", "engine": self.engine, "name": self.name.get_text(),
                 "videos": [row[0] for row in self.video_store], "out": self.out.get_text(),
-                "intrinsics": self.intrinsics.get_text(), "skip_dense": self.skip_dense.get_active()}
+                "intrinsics": self.intrinsics.get_text(), "dense": self.dense_check.get_active()}
 
     def cruise_request(self) -> dict:
         return {"kind": "cruise", "engine": self.engine, "map": self.map_dir.get_text(),

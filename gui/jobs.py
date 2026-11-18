@@ -370,7 +370,10 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
             count = sum(1 for _ in expand_videos(entries))
         except ValueError as error:
             return False, str(error)
-        return True, f"就緒：共 {count} 部影片，按「開始建圖」（同批影片需同長寬比）"
+        if request.get("dense") and mvs_weights() is None:
+            return False, "缺 MVSFormer++ 權重：把 model_best.pth 與 config.json 放到 third_party/mvsformerpp/weights/（或設 ACAM_MVS_CHECKPOINT／ACAM_MVS_CONFIG），或取消勾選「包含稠密點雲」"
+        extra = "＋稠密點雲" if request.get("dense") else ""
+        return True, f"就緒：共 {count} 部影片{extra}，按「開始建圖」（同批影片需同長寬比）"
     if engine == "moge3":
         try:
             count = sum(1 for _ in expand_videos(entries))
@@ -378,6 +381,16 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
             return False, str(error)
         return True, f"就緒：共 {count} 部影片，按「開始建圖」"
     return False, "未知的建圖方式"
+
+
+def mvs_weights() -> tuple[Path, Path] | None:
+    """MVSFormer++ checkpoint + config if the user supplied both files."""
+    base = REPO / "third_party/mvsformerpp"
+    ckpt = Path(os.environ.get("ACAM_MVS_CHECKPOINT", base / "weights/model_best.pth")).expanduser()
+    cfg = Path(os.environ.get("ACAM_MVS_CONFIG", base / "weights/config.json")).expanduser()
+    if ckpt.is_file() and cfg.is_file():
+        return ckpt, cfg
+    return None
 
 
 APPROVAL_FILE = ".acam_map_approved.json"
@@ -445,6 +458,8 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
             raise ValueError(f"準備影片失敗（硬碟空間或權限）：{error}")
         cmd = [str(REPO / "run.sh"), "map", str(staged.resolve()), "--out", str(out), "--name", name,
                "--no-pack"]
+        if request.get("dense"):
+            cmd += ["--dense"]
         if intrinsics:
             cmd += ["--intrinsics", intrinsics]
         return cmd, {"name": name, "result_dir": str(out / name)}
@@ -453,7 +468,7 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
         target = out / name
         cmd = [str(REPO / "run_moge3.sh"), *[str(v.resolve()) for v in videos], "--output", str(target)]
         cmd += ["--intrinsics", intrinsics] if intrinsics else ["--auto_calibrate"]
-        if request.get("skip_dense"):
+        if not request.get("dense", True):
             cmd.append("--skip-dense")
         return cmd, {"name": name, "result_dir": str(target)}
     raise ValueError("未知引擎")
@@ -632,7 +647,7 @@ def create_job(request: dict) -> dict:
         raise
     job = {"id": job_id, "kind": kind, "engine": engine, "status": "queued", "created": time.time(), **meta,
            "engine_python": engine_python,
-           "request": {k: v for k, v in request.items() if k in ("videos", "out", "name", "intrinsics", "video", "map", "route", "skip_dense")}}
+           "request": {k: v for k, v in request.items() if k in ("videos", "out", "name", "intrinsics", "video", "map", "route", "dense")}}
     write_job(job)
     threading.Thread(target=_run, args=(job, cmd), daemon=True).start()
     return job
@@ -769,7 +784,8 @@ def map_result(job: dict) -> list[dict]:
                   ("流程收據", "pipeline_receipt.json")]
     else:
         wanted = [("定位用地圖", "run/artifacts/mapping/edm/model"), ("建圖報告", "MAP_REPORT.md"),
-                  ("轉接包", f"{job.get('name', '')}_bundle.tar.zst"), ("RGB 點雲", "run/products/map/original_rgb.ply")]
+                  ("轉接包", f"{job.get('name', '')}_bundle.tar.zst"), ("RGB 點雲", "run/products/map/original_rgb.ply"),
+                  ("稠密點雲 (MVSFormer++)", "run/products/map/dense/dense.ply")]
     rows = []
     for label, rel in wanted:
         path = base / rel

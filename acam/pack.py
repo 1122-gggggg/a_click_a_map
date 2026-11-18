@@ -85,6 +85,9 @@ def pack(run: Path, out_dir: Path, name: str, *, with_megaloc_weights: bool = Tr
     for file in ("original_rgb.ply", "original_rgb_receipt.json"):
         if (run / "products/map" / file).is_file():
             shutil.copy2(run / "products/map" / file, dense / file)
+    for file in ("dense.ply", "dense_receipt.json"):
+        if (run / "products/map/dense" / file).is_file():
+            shutil.copy2(run / "products/map/dense" / file, dense / file)
     rec = stage / "receipts"
     rec.mkdir()
     for rel in ("products/FINAL_RECEIPT.json", "receipts/direct_preprocessing.json", "inputs/corpus_manifest.json",

@@ -4,6 +4,7 @@
 #   --build            also `pip install -e third_party/gluemap` (needs Ceres/Eigen/METIS/Boost, see README)
 #   --no-checkpoints   skip the ~8 GB of downloads
 # EDM weights are NOT downloaded: place edm_outdoor.ckpt at third_party/EDM/weights/ (or set ACAM_EDM_CHECKPOINT).
+# MVSFormer++ weights are NOT downloaded either: model_best.pth + config.json at third_party/mvsformerpp/weights/ (or set ACAM_MVS_CHECKPOINT/ACAM_MVS_CONFIG).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${ACAM_PYTHON:-python3}"
@@ -51,6 +52,28 @@ clone_pinned https://github.com/chicleee/EDM "$TP/EDM" "$(pin edm)"
 apply_patch "$TP/EDM" "$HERE/patches/edm.patch"
 echo "[3/4] MegaLoc (gmberton/MegaLoc @ $(pin megaloc | cut -c1-9))"
 clone_pinned https://github.com/gmberton/MegaLoc "$TP/MegaLoc" "$(pin megaloc)"
+echo "[3b/4] MVSFormer++ (maybeLx/MVSFormerPlusPlus, SDPA-patched for Blackwell)"
+MVS_PIN="$("$PY" - "$HERE/moge3/configs/versions.json" <<'E'
+import json,sys
+print(json.load(open(sys.argv[1]))["sources"]["mvsformerpp"]["commit"])
+E
+)"
+if [ -d "$TP/mvsformerpp" ] && [ ! -d "$TP/mvsformerpp/.git" ]; then
+  # weights were staged before the repo existed: keep them, clone, put them back
+  rm -rf /tmp/acam_mvs_keep && mkdir -p /tmp/acam_mvs_keep
+  mv "$TP/mvsformerpp/weights" /tmp/acam_mvs_keep/ 2>/dev/null || true
+  rm -rf "$TP/mvsformerpp"
+fi
+clone_pinned https://github.com/maybeLx/MVSFormerPlusPlus "$TP/mvsformerpp" "$MVS_PIN"
+apply_patch "$TP/mvsformerpp" "$HERE/moge3/patches/mvsformerpp-sdpa.patch"
+if [ -d /tmp/acam_mvs_keep/weights ]; then
+  mkdir -p "$TP/mvsformerpp/weights"
+  mv /tmp/acam_mvs_keep/weights/* "$TP/mvsformerpp/weights/" 2>/dev/null || true
+  rm -rf /tmp/acam_mvs_keep
+fi
+mkdir -p "$TP/mvsformerpp/weights"
+[ -f "$TP/mvsformerpp/weights/model_best.pth" ] || { [ -n "${ACAM_MVS_CHECKPOINT:-}" ] && cp "$ACAM_MVS_CHECKPOINT" "$TP/mvsformerpp/weights/model_best.pth" || true; }
+[ -f "$TP/mvsformerpp/weights/config.json" ] || { [ -n "${ACAM_MVS_CONFIG:-}" ] && cp "$ACAM_MVS_CONFIG" "$TP/mvsformerpp/weights/config.json" || true; }
 
 if [ "$BUILD" = 1 ]; then
   echo "building pygluemap (editable)"; (cd "$TP/gluemap" && CMAKE_PREFIX_PATH="${CONDA_PREFIX:-}" "$PY" -m pip install -e .)
@@ -78,4 +101,21 @@ fi
 
 if [ -f "$TP/EDM/weights/edm_outdoor.ckpt" ]; then verify "$TP/EDM/weights/edm_outdoor.ckpt" edm && echo "EDM weights present and verified"
 else echo "NOTE: EDM weights missing. Put edm_outdoor.ckpt in $TP/EDM/weights/ or export ACAM_EDM_CHECKPOINT=/path/to/edm_outdoor.ckpt"; fi
+MVS_SHA="$("$PY" - "$HERE/moge3/configs/versions.json" <<'E'
+import json,sys
+print(json.load(open(sys.argv[1]))["weights"]["mvsformerpp.pth"]["sha256"])
+E
+)"
+if [ -f "$TP/mvsformerpp/weights/model_best.pth" ]; then
+  [ "$(sha256sum "$TP/mvsformerpp/weights/model_best.pth" | cut -d' ' -f1)" = "$MVS_SHA" ] \
+    && echo "MVSFormer++ weights present and verified" \
+    || { echo "SHA256 mismatch for $TP/mvsformerpp/weights/model_best.pth" >&2; exit 1; }
+  [ -f "$TP/mvsformerpp/weights/config.json" ] || echo "NOTE: MVSFormer++ config.json missing next to model_best.pth"
+else echo "NOTE: MVSFormer++ weights missing. Put model_best.pth + config.json in $TP/mvsformerpp/weights/ or export ACAM_MVS_CHECKPOINT/ACAM_MVS_CONFIG"; fi
+"$PY" - <<'E' || "$PY" -m pip install tensorboardX
+try:
+    import tensorboardX  # noqa
+except ImportError:
+    raise SystemExit(1)
+E
 echo "next: ./run.sh doctor"

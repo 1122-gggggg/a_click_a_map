@@ -191,3 +191,48 @@ def test_densest_point_ignores_runaways(tmp_path: Path) -> None:
     qlo, qhi = np.percentile(xyz, [1.0, 99.0], axis=0)
     center = jobs.dense_center(xyz, qlo, qhi)
     assert np.linalg.norm(center - [10.0, 20.0, 30.0]) < 2.0
+
+
+def test_build_map_original_dense_flag(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    _video(tmp_path / "v", "a.mp4")
+    base = {"engine": "original", "videos": [str(tmp_path / "v")], "name": "n",
+            "out": str(tmp_path / "out"), "intrinsics": "", "skip_dense": False}
+    cmd, _ = jobs.build_map_command({**base, "dense": True}, "job1")
+    assert "--dense" in cmd
+    cmd, _ = jobs.build_map_command({**base}, "job9")
+    assert "--dense" not in cmd
+
+
+def test_moge3_dense_defaults_on(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    _video(tmp_path / "v", "a.mp4")
+    base = {"engine": "moge3", "videos": [str(tmp_path / "v")], "name": "n",
+            "out": str(tmp_path / "out"), "intrinsics": ""}
+    cmd, _ = jobs.build_map_command(base, "job1")
+    assert "--skip-dense" not in cmd
+    cmd, _ = jobs.build_map_command({**base, "dense": False}, "job2")
+    assert "--skip-dense" in cmd
+
+
+def test_dense_readiness_needs_weights(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ACAM_MVS_CHECKPOINT", raising=False)
+    monkeypatch.delenv("ACAM_MVS_CONFIG", raising=False)
+    monkeypatch.setattr(jobs, "REPO", tmp_path / "repo")
+    _video(tmp_path, "a.mp4")
+    req = {"engine": "original", "videos": [str(tmp_path / "a.mp4")], "name": "n",
+           "out": str(tmp_path), "intrinsics": "", "dense": True}
+    ok, message = jobs.validate_map_request(req)
+    assert not ok and "MVSFormer++" in message
+    (tmp_path / "repo/third_party/mvsformerpp/weights").mkdir(parents=True)
+    (tmp_path / "repo/third_party/mvsformerpp/weights/model_best.pth").write_bytes(b"w")
+    (tmp_path / "repo/third_party/mvsformerpp/weights/config.json").write_bytes(b"{}")
+    ok, message = jobs.validate_map_request(req)
+    assert ok and "稠密" in message
+
+
+def test_parse_progress_densification_stage() -> None:
+    log = "[2/4] mapping\n  0%| | 0/57\n=== densification (MVSFormer++) ===\n"
+    assert jobs.parse_progress(log)["stage"] == 3
+    log2 = "[2/4] mapping\n=== densification (MVSFormer++) ===\n[3/4] report\n"
+    assert jobs.parse_progress(log2)["stage"] == 4
