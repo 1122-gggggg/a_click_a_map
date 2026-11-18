@@ -35,6 +35,7 @@ import math
 import shutil
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -243,10 +244,22 @@ def find_run_model(run: Path) -> Path:
 
 def export_site(run: Path, out: Path, *, site_id: str, display_name: str, release_id: str) -> Path:
     """Build the localization-side site folder from a finished original-entry run."""
-    import pycolmap
-
     if not site_id or not site_id.replace(".", "").replace("_", "").replace("-", "").isalnum():
         raise ValueError(f"bad site_id {site_id!r}: letters, digits, dot, underscore, hyphen")
+    final = out / site_id
+    if final.exists() or final.is_symlink():
+        raise FileExistsError(f"site folder already exists: {final}")
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".export-", dir=out) as staging:
+        site = Path(staging) / site_id
+        _write_site(run, site, site_id=site_id, display_name=display_name, release_id=release_id)
+        site.rename(final)
+    return final
+
+
+def _write_site(run: Path, site: Path, *, site_id: str, display_name: str, release_id: str) -> None:
+    import pycolmap
+
     run = run.resolve(strict=True)
     model_dir = find_run_model(run)
     reconstruction = pycolmap.Reconstruction(str(model_dir))
@@ -298,7 +311,6 @@ def export_site(run: Path, out: Path, *, site_id: str, display_name: str, releas
     digest = frame_digest(model_dir)
     coordinate_frame_id = f"{release_id}_{digest[:12]}"
 
-    site = out / site_id
     model_out = site / "model"
     keyframes_out = site / "keyframes"
     localization = site / "localization"
@@ -433,7 +445,6 @@ def export_site(run: Path, out: Path, *, site_id: str, display_name: str, releas
                    "megaloc_cache": None, "track_landmarks": None, "poles_json": None},
     }
     write_json(site / "site_profile.json", site_profile)
-    return site
 
 
 def main(argv: list[str] | None = None) -> int:

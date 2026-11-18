@@ -148,8 +148,12 @@ def test_export_site_validates_against_localization_repo(tmp_path: Path) -> None
 
 def test_export_matches_delivery_tree_with_optional_dense(tmp_path: Path) -> None:
     run = _synthetic_run(tmp_path, n_images=120, n_points=100)
-    site = export.export_site(run, tmp_path / "s1", site_id="treecheck",
-                              display_name="Tree", release_id="treecheck_20261118")
+    from acam.cli import main
+
+    out = tmp_path / "s1"
+    assert main(["export-site", str(run), "--out", str(out), "--site-id", "treecheck",
+                 "--display-name", "Tree", "--release-id", "treecheck_20261118"]) == 0
+    site = out / "treecheck"
     import json as _json
     top = {p.name for p in site.iterdir()}
     assert top == {"site_profile.json", "map", "model", "keyframes", "localization"}, top
@@ -170,3 +174,18 @@ def test_export_matches_delivery_tree_with_optional_dense(tmp_path: Path) -> Non
     assert (site2 / "map/map_dense.ply").is_file()
     bundle = _json.loads((site2 / "localization/direct_bundle.json").read_text(encoding="utf-8"))
     assert "../map/map_dense.ply" in [e["path"] for e in bundle["files"]]
+
+
+def test_failed_export_does_not_leave_a_partial_delivery(tmp_path: Path) -> None:
+    out = tmp_path / "delivery"
+    ids = {"site_id": "retry", "display_name": "Retry", "release_id": "retry_v1"}
+    too_small = _synthetic_run(tmp_path / "small", n_images=20, n_points=10)
+    with pytest.raises(ValueError, match="at least 100 registered images"):
+        export.export_site(too_small, out, **ids)
+    assert not list(out.iterdir())
+
+    valid = _synthetic_run(tmp_path / "valid", n_images=120, n_points=20)
+    site = export.export_site(valid, out, **ids)
+    assert (site / "site_profile.json").is_file()
+    with pytest.raises(FileExistsError, match="site folder already exists"):
+        export.export_site(valid, out, **ids)

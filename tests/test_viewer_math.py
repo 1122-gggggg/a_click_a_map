@@ -35,6 +35,7 @@ def _viewer_with_outliers():
     viewer.colors = np.zeros((len(viewer.points), 3), dtype=np.uint8)
     viewer.total = len(viewer.points)
     viewer.center = np.zeros(3)
+    viewer.pan_x, viewer.pan_y = 0.0, 0.0
     viewer.yaw, viewer.pitch, viewer.dist = 0.7, 0.45, 20.0 * 1.7
     viewer.span = np.array([1.8e7, 50.0, 50.0])
     viewer.fit_span = 20.0
@@ -107,6 +108,7 @@ def _viewer_with_points(n: int = 3000, seed: int = 1):
     viewer.fit_span, viewer.outlier_ratio, viewer.height = 30.0, 0.0, 300
     viewer.drag_button, viewer.last, viewer.on_change = 0, (0.0, 0.0), None
     viewer.center = np.array([0.0, 0.0, 50.0])
+    viewer.pan_x, viewer.pan_y = 0.0, 0.0
     viewer.box = types.SimpleNamespace(get_allocated_width=lambda: 800)
     viewer.render_calls = []
     viewer.render = lambda: viewer.render_calls.append(1)
@@ -160,3 +162,27 @@ def test_drag_never_gets_stuck() -> None:
     assert -np.pi <= viewer.pitch <= np.pi
     viewer.on_drag_end(gesture, 0.0, 0.0)
     assert id(gesture) not in viewer._drag_last
+
+
+def test_right_drag_translates_cloud_and_keeps_zoom_at_cursor() -> None:
+    viewer, (up, _, _, _) = _viewer_with_gestures()
+    gesture = _FakeGesture()
+    sx, sy, depth, ok, *_ = viewer._project(800, 300)
+    visible = ok & (80 <= sx) & (sx < 720) & (60 <= sy) & (sy < 240)
+    center = viewer.center.copy()
+
+    viewer.on_drag_begin(gesture, 300.0, 100.0)
+    viewer.on_drag_update(gesture, 15.0, 9.0, True)
+    viewer.on_drag_update(gesture, 42.0, 27.0, True)
+    viewer.on_drag_end(gesture, 42.0, 27.0)
+    moved_x, moved_y, moved_depth, *_ = viewer._project(800, 300)
+    np.testing.assert_array_equal(moved_x[visible], sx[visible] + 42)
+    np.testing.assert_array_equal(moved_y[visible], sy[visible] + 27)
+    np.testing.assert_array_equal(moved_depth, depth)
+    np.testing.assert_array_equal(viewer.center, center)
+
+    idx = int(np.flatnonzero(visible)[0])
+    viewer.on_scroll(None, _FakeEvent(up, float(moved_x[idx]), float(moved_y[idx])))
+    zoom_x, zoom_y, *_ = viewer._project(800, 300)
+    assert abs(zoom_x[idx] - moved_x[idx]) <= 1
+    assert abs(zoom_y[idx] - moved_y[idx]) <= 1

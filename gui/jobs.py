@@ -491,64 +491,54 @@ def build_pack_command(map_dir: str | Path, job_id: str) -> tuple[list[str], dic
     return cmd, {"name": f"{base.name} 打包", "result_dir": str(base)}
 
 
-def _dir_size(root: Path) -> tuple[int, int]:
-    total, count = 0, 0
-    if root.is_dir():
-        for path in root.rglob("*"):
-            if path.is_file() and not path.is_symlink():
-                try:
-                    total += path.stat().st_size
-                    count += 1
-                except OSError:
-                    pass
-    return total, count
+def delivery_site(map_dir: str | Path) -> Path:
+    base = Path(map_dir).expanduser().resolve()
+    site_id = re.sub(r"[^A-Za-z0-9._-]+", "_", base.name)[:64].strip("._-") or "site"
+    return base / "場域交付" / site_id
 
 
-def pack_preview(map_dir: str | Path) -> list[dict]:
-    """What `run.sh pack` is about to put in the bundle, grouped for confirmation.
-
-    Mirrors acam/pack.py's file selection (kept in sync by hand; the builder
-    itself is the authority at pack time). Keyframe JPEGs are summarized by
-    count instead of listed one by one.
-    """
+def _build_export_command(map_dir: str | Path) -> tuple[list[str], dict]:
     base = Path(map_dir).expanduser().resolve()
     run = base / "run"
-    rows: list[dict] = []
+    if not run.is_dir() or not is_map_approved(base)[0]:
+        raise ValueError("找不到已確認的建圖成果，請先完成 3D 檢查")
+    site = delivery_site(base)
+    if site.exists():
+        raise ValueError(f"交付資料夾已存在：{site}")
+    cmd = [str(REPO / "run.sh"), "export-site", str(run), "--out", str(site.parent),
+           "--site-id", site.name, "--display-name", base.name]
+    return cmd, {"name": base.name, "result_dir": str(site)}
 
-    def add(label: str, paths: list[Path]) -> None:
-        files = [p for p in paths if p.is_file()]
-        if not files:
-            return
-        rows.append({"label": label, "path": str(files[0].parent), "size": human(sum(p.stat().st_size for p in files)),
-                     "detail": f"{len(files)} 個檔案"})
 
-    model = run / "artifacts/mapping/edm/model"
-    add("定位用地圖（COLMAP）", [model / n for n in ("cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin")])
-    glue_size, glue_count = _dir_size(run / "artifacts/mapping/direct/model")
-    if glue_count:
-        rows.append({"label": "建圖原始模型（稠密化輸入用）", "path": str(run / "artifacts/mapping/direct/model"),
-                     "size": human(glue_size), "detail": f"{glue_count} 個檔案"})
-    keyframes = run / "artifacts/keyframes/images"
-    kf_size, kf_count = _dir_size(keyframes)
-    if kf_count:
-        rows.append({"label": "關鍵影格 JPEG（定位比對用）", "path": str(keyframes), "size": human(kf_size), "detail": f"{kf_count} 張"})
-    add("檢索 bank＋定位設定", [run / "products/localization/megaloc_references.npy",
-                              run / "products/localization/megaloc_references.names.json",
-                              run / "products/localization/reference_manifest.jsonl",
-                              run / "products/localization/localizer_config.json",
-                              run / "products/map/original_rgb.ply"])
-    dense = run / "products/map/dense"
-    if (dense / "dense.ply").is_file():
-        size, _ = _dir_size(dense)
-        rows.append({"label": "稠密點雲", "path": str(dense / "dense.ply"), "size": human(size), "detail": "MVSFormer++"})
-    return rows
+def _dir_size(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file() and not path.is_symlink())
+
+
+def export_result(job: dict) -> list[dict]:
+    if job["status"] != "done":
+        return []
+    site = Path(job["result_dir"])
+    profile = site / "site_profile.json"
+    folders = [site / name for name in ("map", "localization", "model", "keyframes")]
+    if not profile.is_file() or not all(folder.is_dir() for folder in folders):
+        return []
+    paths = [profile]
+    for folder in folders:
+        paths.extend(sorted(folder.iterdir()))
+    rows = []
+    total = 0
+    for path in paths:
+        size = _dir_size(path) if path.is_dir() else path.stat().st_size
+        total += size
+        rows.append({"label": path.relative_to(site).as_posix(), "path": str(path), "size": human(size)})
+    return [{"label": "搬這整個場域資料夾", "path": str(site), "size": human(total)}, *rows]
 
 
 def pack_result(job: dict) -> list[dict]:
     bundle = map_bundle(job.get("result_dir", ""))
     if bundle is None:
         return []
-    return [{"label": "轉接包（搬到另一台電腦）", "path": str(bundle), "size": human(bundle.stat().st_size)}]
+    return [{"label": "建圖轉接包（非場域匯入）", "path": str(bundle), "size": human(bundle.stat().st_size)}]
 
 
 def build_cruise_command(request: dict, job_id: str) -> tuple[list[str] | str, dict]:
@@ -622,10 +612,10 @@ def _run(job: dict, cmd: list[str] | str) -> None:
 
 def create_job(request: dict) -> dict:
     kind, engine = request.get("kind"), request.get("engine")
-    if kind not in ("map", "cruise", "pack") or engine not in ("original", "moge3"):
+    if kind not in ("map", "cruise", "pack", "export") or engine not in ("original", "moge3"):
         raise ValueError("任務類型或引擎錯誤")
-    if kind == "pack" and engine != "original":
-        raise ValueError("只有原始版需要單獨打包")
+    if kind in ("pack", "export") and engine != "original":
+        raise ValueError("此交付格式只支援原始版")
     status = engine_status()[engine]
     if not status["ready"]:
         raise ValueError("此引擎尚未安裝：" + status["hint"])
@@ -640,6 +630,8 @@ def create_job(request: dict) -> dict:
             cmd, meta = build_map_command(request, job_id)
         elif kind == "cruise":
             cmd, meta = build_cruise_command(request, job_id)
+        elif kind == "export":
+            cmd, meta = _build_export_command(request["map"])
         else:
             cmd, meta = build_pack_command(request["map"], job_id)
     except ValueError:
@@ -780,13 +772,18 @@ def map_result(job: dict) -> list[dict]:
     base = Path(job.get("result_dir", ""))
     if job["engine"] == "moge3":
         wanted = [("稀疏點雲 (原始 RGB)", "map/sparse_rgb.ply"), ("稠密點雲 (MVSFormer++)", "dense/dense.ply"),
-                  ("COLMAP 地圖", "map/model"), ("定位包 (搬到另一台電腦)", "localization/bundle"),
+                  ("COLMAP 地圖", "map/model"), ("獨立定位包（非場域匯入）", "localization/bundle"),
                   ("流程收據", "pipeline_receipt.json")]
     else:
         wanted = [("定位用地圖", "run/artifacts/mapping/edm/model"), ("建圖報告", "MAP_REPORT.md"),
-                  ("轉接包", f"{job.get('name', '')}_bundle.tar.zst"), ("RGB 點雲", "run/products/map/original_rgb.ply"),
+                  ("建圖轉接包（非場域匯入）", f"{job.get('name', '')}_bundle.tar.zst"),
+                  ("RGB 點雲", "run/products/map/original_rgb.ply"),
                   ("稠密點雲 (MVSFormer++)", "run/products/map/dense/dense.ply")]
     rows = []
+    if job["engine"] == "original":
+        site = delivery_site(base)
+        if (site / "site_profile.json").is_file():
+            rows.append({"label": "搬這整個場域資料夾", "path": str(site), "size": ""})
     for label, rel in wanted:
         path = base / rel
         if path.exists():

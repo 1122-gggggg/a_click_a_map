@@ -38,7 +38,7 @@ STATUS_COLOR = {"queued": "#9a6700", "running": "#9a6700", "done": "#1a7f37", "f
 POSE_COLOR = {"RELOC_SEED": (63, 185, 80), "FAST_TRACK": (58, 160, 255), "VO_ONLY": (210, 153, 34),
               "DEAD_RECKON": (163, 113, 247), "NO_POSE": (248, 81, 73)}
 POSE_NAME = {"RELOC_SEED": "重新定位", "FAST_TRACK": "追蹤中", "VO_ONLY": "里程計", "DEAD_RECKON": "推算", "NO_POSE": "無位姿"}
-KIND_NAME = {"map": "建圖", "cruise": "巡航定位", "pack": "打包"}
+KIND_NAME = {"map": "建圖", "cruise": "巡航定位", "pack": "打包", "export": "交付匯出"}
 FINAL = ("done", "failed", "stopped", "interrupted")
 CSS = b"""
 * { font-size: 11pt; }
@@ -138,7 +138,7 @@ class MapViewer:
     """Software-rendered RGB point cloud inspector (no GL needed).
 
     左鍵拖曳旋轉，左鍵點兩下把旋轉中心換到點到的位置，
-    右鍵拖曳平移，滾輪縮放。Renders into a Gtk.Image via numpy.
+    右鍵拖曳讓點雲跟著游標平移，滾輪縮放。Renders into a Gtk.Image via numpy.
     """
 
     BG = (13, 17, 23)
@@ -149,6 +149,7 @@ class MapViewer:
         self.colors = np.zeros((0, 3), dtype=np.uint8)
         self.total = 0
         self.center = np.zeros(3)
+        self.pan_x, self.pan_y = 0.0, 0.0
         self.yaw, self.pitch, self.dist = 0.7, 0.45, 10.0
         self.span = np.ones(3)
         self.fit_span = 1.0
@@ -156,10 +157,16 @@ class MapViewer:
         self.expand = expand
         self.height = VIEWER_HEIGHT
         self.image = Gtk.Image()
-        if not expand:
-            self.image.set_size_request(-1, VIEWER_HEIGHT)
+        # The rendered pixbuf must not set the window's minimum size.
+        # Only the overlay's main child contributes to its size request.
+        viewport = Gtk.Overlay()
+        surface = Gtk.DrawingArea()
+        surface.set_size_request(320, 200 if expand else VIEWER_HEIGHT)
+        viewport.add(surface)
+        viewport.add_overlay(self.image)
+        viewport.set_overlay_pass_through(self.image, True)
         self.box = Gtk.EventBox()
-        self.box.add(self.image)
+        self.box.add(viewport)
         self.box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.SCROLL_MASK)
         self.box.connect("button-press-event", self.on_press)
         self.box.connect("scroll-event", self.on_scroll)
@@ -179,12 +186,12 @@ class MapViewer:
         self._drag_last: dict = {}
         self.on_change = None
 
-    def on_allocate(self, _widget, _allocation) -> None:
+    def on_allocate(self, _widget, allocation) -> None:
         if self.expand:
-            fitted = max(self.box.get_allocated_height(), 200)
-            if fitted != self.height:
-                self.height = fitted
-        self.render()
+            self.height = max(allocation.height, 200)
+        pixbuf = self.image.get_pixbuf()
+        if pixbuf is None or (pixbuf.get_width(), pixbuf.get_height()) != (max(allocation.width, 320), self.height):
+            self.render()
 
     def load(self, path: Path) -> dict:
         xyz, rgb, total = jobs.read_ply_points(path)
@@ -201,6 +208,7 @@ class MapViewer:
         self.fit_span = float(np.maximum(qhi - qlo, 1e-9).max())
         self.outlier_ratio = float(np.mean((xyz < qlo).any(axis=1) | (xyz > qhi).any(axis=1)))
         self.yaw, self.pitch = 0.7, 0.45
+        self.pan_x, self.pan_y = 0.0, 0.0
         self.dist = self.fit_span * 1.7
         self.render()
         return self.info()
@@ -223,6 +231,9 @@ class MapViewer:
         cy, sy, cp, sp = np.cos(self.yaw), np.sin(self.yaw), np.cos(self.pitch), np.sin(self.pitch)
         return np.array([[cy, 0.0, sy], [sy * sp, cp, -cy * sp], [-sy * cp, sp, cy * cp]])
 
+    def _screen_origin(self, width: int, height: int) -> tuple[float, float]:
+        return width / 2.0 + self.pan_x, height / 2.0 + self.pan_y
+
     def _project(self, width: int, height: int):
         rot = self._rotation()
         cam = (self.points - self.center) @ rot.T
@@ -231,8 +242,9 @@ class MapViewer:
         ok = depth > 1e-6
         sx = np.full(len(self.points), -1)
         sy = np.full(len(self.points), -1)
-        sx[ok] = (width / 2.0 + focal * cam[ok, 0] / depth[ok]).astype(int)
-        sy[ok] = (height / 2.0 - focal * cam[ok, 1] / depth[ok]).astype(int)
+        x, y = self._screen_origin(width, height)
+        sx[ok] = (x + focal * cam[ok, 0] / depth[ok]).astype(int)
+        sy[ok] = (y - focal * cam[ok, 1] / depth[ok]).astype(int)
         return sx, sy, depth, ok, rot, focal
 
     def render(self) -> None:
@@ -249,7 +261,7 @@ class MapViewer:
                 order = np.argsort(d)[::-1]
                 flat = sy[inside][order] * width + sx[inside][order]
                 canvas.reshape(-1, 3)[flat] = (self.colors[inside][order] * shade[order]).astype(np.uint8)
-            x, y = width // 2, height // 2
+            x, y = map(int, self._screen_origin(width, height))
             for o in range(-5, 6):
                 for xx, yy in ((x + o, y), (x, y + o)):
                     if 0 <= xx < width and 0 <= yy < height:
@@ -259,6 +271,7 @@ class MapViewer:
 
     def reset_view(self) -> None:
         self.yaw, self.pitch = 0.7, 0.45
+        self.pan_x, self.pan_y = 0.0, 0.0
         self.dist = float(self.fit_span * 1.7)
         self.render()
         if self.on_change:
@@ -288,10 +301,8 @@ class MapViewer:
             # pole like a trackball instead of getting stuck against a wall.
             self.pitch = (self.pitch + dy * 0.008 + np.pi) % (2.0 * np.pi) - np.pi
         else:
-            rot = self._rotation()
-            scale = self.dist / (max(self.height, 200) * 1.3)
-            right, up = rot.T[:, 0], -rot.T[:, 1]
-            self.center = self.center + right * dx * scale - up * dy * scale
+            self.pan_x += dx
+            self.pan_y += dy
         self.render()
         if self.on_change:
             self.on_change()
@@ -318,8 +329,9 @@ class MapViewer:
             rot = self._rotation()
             shift = (old - self.dist) / focal
             right, up = rot.T[:, 0], -rot.T[:, 1]
-            self.center = (self.center + right * float(event.x - width / 2.0) * shift
-                           + up * float(event.y - height / 2.0) * shift)
+            x, y = self._screen_origin(width, height)
+            self.center = (self.center + right * (event.x - x) * shift
+                           + up * (event.y - y) * shift)
         self.render()
         return True
 
@@ -336,6 +348,7 @@ class MapViewer:
             return
         idx = np.flatnonzero(cand)[int(d2.argmin())]
         self.center = self.points[idx].copy()
+        self.pan_x, self.pan_y = 0.0, 0.0
         self.render()
         if self.on_change:
             self.on_change()
@@ -350,17 +363,43 @@ class MapViewerWindow(Gtk.Window):
         self.viewer.on_change = self.update_label
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
         self.add(box)
-        hint = css_label("左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪以游標為中心縮放", "hint", wrap=True)
+        hint = css_label("左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳移動點雲 · 滾輪以游標為中心縮放",
+                         "hint", wrap=True)
         box.pack_start(hint, False, False, 0)
         box.pack_start(self.viewer.box, True, True, 0)
         row = Gtk.Box(spacing=6)
         self.label = css_label("", "hint", wrap=True)
         self.label.set_selectable(True)
         row.pack_start(self.label, True, True, 0)
+        self.fullscreen_button = Gtk.Button(label="全螢幕（F11）")
+        self.fullscreen_button.connect("clicked", self.toggle_fullscreen)
+        row.pack_start(self.fullscreen_button, False, False, 0)
         reset_button = Gtk.Button(label="重設視角")
         reset_button.connect("clicked", lambda _b: self.viewer.reset_view())
         row.pack_start(reset_button, False, False, 0)
         box.pack_start(row, False, False, 0)
+        self.connect("window-state-event", self.on_window_state)
+        self.connect("key-press-event", self.on_key_press)
+
+    def toggle_fullscreen(self, _button=None) -> None:
+        if self.get_window().get_state() & Gdk.WindowState.FULLSCREEN:
+            self.unfullscreen()
+        else:
+            self.fullscreen()
+
+    def on_window_state(self, _window, event) -> bool:
+        fullscreen = event.new_window_state & Gdk.WindowState.FULLSCREEN
+        self.fullscreen_button.set_label("離開全螢幕（Esc）" if fullscreen else "全螢幕（F11）")
+        return False
+
+    def on_key_press(self, _window, event) -> bool:
+        if event.keyval == Gdk.KEY_F11:
+            self.toggle_fullscreen()
+            return True
+        if event.keyval == Gdk.KEY_Escape and self.get_window().get_state() & Gdk.WindowState.FULLSCREEN:
+            self.unfullscreen()
+            return True
+        return False
 
     def update_label(self) -> None:
         self.label.set_text(self.viewer.describe())
@@ -635,6 +674,10 @@ class App(Gtk.Window):
         box.pack_start(top, False, False, 4)
 
         box.pack_start(css_label("結果（完成後出現在這裡；點雲檔點兩下開大視窗檢視，其他檔名點兩下用外部程式開啟）", "step"), False, False, 0)
+        self.transfer_hint = css_label("", "hint", wrap=True)
+        self.transfer_hint.set_selectable(True)
+        self.transfer_hint.set_no_show_all(True)
+        box.pack_start(self.transfer_hint, False, False, 0)
         self.result_stack = Gtk.Stack()
         self.result_hint = css_label("任務完成後顯示結果", "hint")
         self.result_stack.add_named(self.result_hint, "hint")
@@ -649,7 +692,7 @@ class App(Gtk.Window):
             files.append_column(column)
         files.connect("row-activated", self.open_result_row)
         map_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.viewer_frame = Gtk.Frame(label=" 3D 檢查：左鍵拖曳旋轉 · 左鍵點兩下設旋轉中心 · 右鍵拖曳平移 · 滾輪以游標為中心縮放 ")
+        self.viewer_frame = Gtk.Frame(label=" 3D 檢查：左鍵旋轉／雙擊設中心 · 右鍵移動點雲 · 滾輪縮放 ")
         viewer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=6)
         self.viewer = MapViewer()
         self.viewer.on_change = self.update_viewer_label
@@ -664,10 +707,11 @@ class App(Gtk.Window):
         self.approve_button.set_tooltip_text("在上方 3D 檢視裡轉一轉、確認地圖沒有明顯問題後再按。按了巡航定位才會放行。")
         self.approve_button.connect("clicked", self.approve_current_map)
         approval_row.pack_start(self.approve_button, False, False, 0)
-        self.pack_button = Gtk.Button(label="📦 打包轉接包")
-        self.pack_button.set_tooltip_text("把這張地圖包成可搬到另一台電腦的轉接包；只在這台巡航可以不打")
-        self.pack_button.connect("clicked", self.pack_current_map)
-        approval_row.pack_start(self.pack_button, False, False, 0)
+        self.export_button = Gtk.Button(label="匯出場域")
+        self.export_button.set_tooltip_text("產生另一台電腦可用「＋新增地圖」匯入的場域資料夾")
+        self.export_button.set_no_show_all(True)
+        self.export_button.connect("clicked", self.export_current_map)
+        approval_row.pack_start(self.export_button, False, False, 0)
         big_button = Gtk.Button(label="🔍 大視窗")
         big_button.set_tooltip_text("用大視窗看目前這份點雲（跟點兩下檔名一樣）")
         big_button.connect("clicked", lambda _b: self.open_big_viewer())
@@ -1206,9 +1250,10 @@ class App(Gtk.Window):
             self.approval_label.set_text("○ 尚未確認：先在上方 3D 檢視檢查地圖（轉一轉、放大看看有沒有明顯破碎或錯位），沒問題再按右邊確認")
             self.approve_button.set_label("✓ 確認地圖可用，可以巡航")
         self.approve_button.set_sensitive(bool(self.viewer_info) or approved)
-        show_pack = (approved and self.approved_engine == "original"
-                     and jobs.map_bundle(self.approved_dir) is None)
-        self.pack_button.set_visible(show_pack)
+        self.export_button.set_visible(
+            approved and self.approved_engine == "original"
+            and not (jobs.delivery_site(self.approved_dir) / "site_profile.json").is_file()
+        )
 
     def approve_current_map(self, _button=None) -> None:
         if not self.approved_dir:
@@ -1223,36 +1268,35 @@ class App(Gtk.Window):
         self.refresh_approval_ui()
         self.refresh_map_choices(force=True)
         self.update_readiness()
-        if (self.approved_engine == "original" and jobs.map_bundle(self.approved_dir) is None
-                and self.ask_pack_now()):
-            self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
+        self.export_current_map()
 
-    def ask_pack_now(self) -> bool:
-        rows = jobs.pack_preview(self.approved_dir)
-        if not rows:
-            self.error("找不到可打包的檔案（地圖輸出不完整），請檢查建圖結果。")
-            return False
-        lines = "\n".join(f"• {r['label']}：{r['size']}（{r.get('detail', '')}）" for r in rows)
-        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-                                   buttons=Gtk.ButtonsType.YES_NO,
-                                   text="地圖已確認可用。要現在打包轉接包嗎？\n\n" + lines + "\n\n"
-                                        "另外會附上：定位程式、安裝腳本、MegaLoc 權重。\n"
-                                        "EDM 定位權重不會打包（另一台電腦需自備，放好再定位）。\n"
-                                        "只在這台巡航可按否，以後隨時按「📦 打包轉接包」補打。")
-        answer = dialog.run()
-        dialog.destroy()
-        return answer == Gtk.ResponseType.YES
-
-    def pack_current_map(self, _button=None) -> None:
+    def export_current_map(self, _button=None) -> None:
         if not self.approved_dir or self.approved_engine != "original":
             return
-        if jobs.map_bundle(self.approved_dir) is not None:
+        base = Path(self.approved_dir)
+        site = jobs.delivery_site(base)
+        if (site / "site_profile.json").is_file():
             return
-        if self.ask_pack_now():
-            self.submit({"kind": "pack", "engine": "original", "map": self.approved_dir})
+        dense = "\n• map/map_dense.ply（稠密點雲）" if (base / "run/products/map/dense/dense.ply").is_file() else ""
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO, text="要匯出到另一台電腦使用的場域嗎？",
+        )
+        dialog.format_secondary_text(
+            f"{site}\n\n"
+            f"• site_profile.json（場域設定）\n• map/map.ply（RGB 主地圖）{dense}\n"
+            "• localization/（定位設定、對齊、參考資料）\n"
+            "• model/（COLMAP 模型）\n• keyframes/（關鍵影格 JPEG 與清單）\n\n"
+            "不包含原始影片或航線。匯出完成後請搬整個場域資料夾。"
+        )
+        answer = dialog.run()
+        dialog.destroy()
+        if answer == Gtk.ResponseType.YES:
+            self.submit({"kind": "export", "engine": "original", "map": str(base)})
 
     def show_result(self, job: dict | None) -> None:
         self.plot_points = []
+        self.transfer_hint.hide()
         if job is None or job["kind"] != "map":
             self.approved_dir = None
             self.approved_engine = ""
@@ -1276,6 +1320,28 @@ class App(Gtk.Window):
                 self.result_hint.set_text(hint)
                 self.result_stack.set_visible_child_name("hint")
             self.load_map_viewer(job)
+            return
+        if job["kind"] == "export":
+            rows = jobs.export_result(job)
+            self.file_store.clear()
+            for row in rows:
+                self.file_store.append([row["label"], row["path"], row["size"]])
+            if rows:
+                self.transfer_hint.set_text(
+                    f"搬到另一台電腦：{rows[0]['path']}\n"
+                    "把這個資料夾整個複製過去，再在定位端按「＋新增地圖」選它（直接包含 site_profile.json 的那一層）。"
+                )
+                self.transfer_hint.show()
+                self.result_stack.set_visible_child_name("files")
+            else:
+                hint = {
+                    "failed": "匯出失敗：請看上方日誌，排除原因後再續跑。",
+                    "stopped": "匯出已停止。",
+                    "interrupted": "匯出已中斷。",
+                    "done": "找不到已匯出的場域資料夾，可能已經搬移。",
+                }.get(job["status"], "正在匯出場域，完成後會列出要搬的檔案。")
+                self.result_hint.set_text(hint)
+                self.result_stack.set_visible_child_name("hint")
             return
         if job["kind"] == "pack":
             rows = jobs.pack_result(job)

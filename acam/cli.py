@@ -308,6 +308,7 @@ def cmd_export_site(args: argparse.Namespace) -> int:
         say(f"export-site failed: {error}")
         return 3
     say(str(site))
+    return 0
 
 
 # --------------------------------------------------------------------------- argparse
