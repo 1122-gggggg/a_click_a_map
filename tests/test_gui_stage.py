@@ -66,3 +66,30 @@ def test_validate_original_counts_videos_not_entries(tmp_path: Path) -> None:
         {"engine": "original", "videos": [str(tmp_path / "d1"), str(tmp_path / "c.mp4")],
          "name": "n", "out": str(tmp_path), "intrinsics": ""})
     assert ok and "共 3 部影片" in message
+
+
+def test_find_engine_python_prefers_explicit_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ACAM_PYTHON", str(tmp_path / "custom" / "python"))
+    (tmp_path / "custom").mkdir()
+    (tmp_path / "custom" / "python").write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(jobs, "_probe_engine_python", lambda p: calls.append(p) or p.endswith("custom/python"))
+    monkeypatch.setattr(jobs, "toolkit", lambda: tmp_path / "nope")
+    jobs.reset_engine_python_cache()
+    try:
+        assert jobs.find_engine_python() == str(tmp_path / "custom" / "python")
+        assert jobs.find_engine_python() == str(tmp_path / "custom" / "python")
+        assert len(calls) == 1  # second call served from cache
+    finally:
+        jobs.reset_engine_python_cache()
+
+
+def test_find_engine_python_none_when_nothing_works(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ACAM_PYTHON", raising=False)
+    monkeypatch.setattr(jobs, "_probe_engine_python", lambda p: False)
+    monkeypatch.setattr(jobs, "toolkit", lambda: tmp_path / "nope")
+    jobs.reset_engine_python_cache()
+    try:
+        assert jobs.find_engine_python() is None
+    finally:
+        jobs.reset_engine_python_cache()

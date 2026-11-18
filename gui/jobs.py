@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import shlex
 import signal
 import subprocess
@@ -90,6 +91,51 @@ def engine_status() -> dict[str, dict]:
         },
     }
 
+
+_ENGINE_PYTHON: str | None = None
+_ENGINE_PYTHON_CHECKED = False
+
+
+def _probe_engine_python(python: str) -> bool:
+    """True if this interpreter can run the mapping engine (torch + pycolmap + gluemap)."""
+    try:
+        result = subprocess.run(
+            [python, "-c", "import torch, pycolmap, gluemap; assert torch.cuda.is_available()"],
+            capture_output=True, timeout=90)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def find_engine_python() -> str | None:
+    """Pick an interpreter for engine commands, cached per GUI process.
+
+    Order: $ACAM_PYTHON (explicit choice wins) → MoGe-3 toolkit env →
+    well-known conda-style envs → the GUI's own interpreter. Returns None
+    when nothing on this machine can run the engine.
+    """
+    global _ENGINE_PYTHON, _ENGINE_PYTHON_CHECKED
+    if _ENGINE_PYTHON_CHECKED:
+        return _ENGINE_PYTHON
+    home = Path.home()
+    candidates = [
+        os.environ.get("ACAM_PYTHON") or "",
+        str(toolkit() / "envs/gluemap/bin/python"),
+        str(home / "micromamba/envs/gluemap/bin/python"),
+        str(home / "miniconda3/envs/gluemap/bin/python"),
+        str(home / "anaconda3/envs/gluemap/bin/python"),
+        sys.executable,
+    ]
+    _ENGINE_PYTHON = next(
+        (c for c in dict.fromkeys(candidates) if c and Path(c).is_file() and _probe_engine_python(c)), None)
+    _ENGINE_PYTHON_CHECKED = True
+    return _ENGINE_PYTHON
+
+
+def reset_engine_python_cache() -> None:
+    """Forget the cached probe (tests only)."""
+    global _ENGINE_PYTHON, _ENGINE_PYTHON_CHECKED
+    _ENGINE_PYTHON, _ENGINE_PYTHON_CHECKED = None, False
 
 def loc_python() -> str:
     return os.environ.get("LOC_PYTHON") or str(toolkit() / "envs/gluemap/bin/python")
@@ -332,6 +378,8 @@ def _run(job: dict, cmd: list[str] | str) -> None:
     directory = job_dir(job["id"])
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["PYTHONUNBUFFERED"] = "1"
+    if job.get("engine_python"):
+        env["ACAM_PYTHON"] = job["engine_python"]
     log = (directory / "log.txt").open("ab", buffering=0)
     log.write(("$ " + (cmd if isinstance(cmd, str) else " ".join(shlex.quote(c) for c in cmd)) + "\n").encode())
     try:
@@ -364,12 +412,17 @@ def create_job(request: dict) -> dict:
         raise ValueError("此引擎尚未安裝：" + status["hint"])
     job_id = time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
     job_dir(job_id).mkdir(parents=True)
+    engine_python = find_engine_python()
+    if not engine_python:
+        job_dir(job_id).rmdir()
+        raise ValueError("找不到可跑引擎的 Python（需 torch＋CUDA、pycolmap、pygluemap）：先跑 setup，或設 ACAM_PYTHON 再重開程式")
     try:
         cmd, meta = build_map_command(request, job_id) if kind == "map" else build_cruise_command(request, job_id)
     except ValueError:
         job_dir(job_id).rmdir()
         raise
     job = {"id": job_id, "kind": kind, "engine": engine, "status": "queued", "created": time.time(), **meta,
+           "engine_python": engine_python,
            "request": {k: v for k, v in request.items() if k in ("videos", "out", "name", "intrinsics", "video", "map", "route", "skip_dense")}}
     write_job(job)
     threading.Thread(target=_run, args=(job, cmd), daemon=True).start()
