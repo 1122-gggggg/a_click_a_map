@@ -647,6 +647,8 @@ class App(Gtk.Window):
         self.status_label = Gtk.Label(xalign=0, use_markup=True)
         self.elapsed_label = css_label("", "hint")
         self.stage_label = Gtk.Label(xalign=0, use_markup=True)
+        self.stage_label.set_line_wrap(True)
+        self.stage_label.set_max_width_chars(80)
         self.stage_bar = Gtk.ProgressBar(show_text=True)
         self.stage_bar.set_no_show_all(True)
         self.path_label = css_label("", "hint")
@@ -703,6 +705,9 @@ class App(Gtk.Window):
         viewer_box.pack_start(self.viewer.box, False, False, 0)
         self.viewer_label = css_label("", "hint", wrap=True)
         viewer_box.pack_start(self.viewer_label, False, False, 0)
+        self.connect_warn = css_label("", "warn", wrap=True)
+        self.connect_warn.set_no_show_all(True)
+        viewer_box.pack_start(self.connect_warn, False, False, 0)
         self.approval_label = css_label("", "hint", wrap=True)
         viewer_box.pack_start(self.approval_label, False, False, 0)
         approval_row = Gtk.Box(spacing=6)
@@ -1166,7 +1171,36 @@ class App(Gtk.Window):
                 parts.append(f"▶ {name}")
             else:
                 parts.append(f"○ {name}")
-        self.stage_label.set_text(" → ".join(parts))
+        checklist = " → ".join(parts)
+        # Engine-side detail: the job log's tqdm freezes at 100% after track
+        # concatenation while Ceres BA still runs. Prefer mapping.log here.
+        engine_text, engine_age = jobs.read_engine_log_tail(job)
+        phase = jobs.parse_mapping_phase(engine_text) if engine_text else {"phase": None, "in_ba": False}
+        if stage == 2 and phase.get("phase"):
+            alive = f"（日誌 {int(engine_age)} 秒前更新，程式還活著）" if engine_age is not None else ""
+            if phase.get("in_ba"):
+                # Misleading 100%: BA has no tqdm, so pulse instead of showing 226/226.
+                self.stage_label.set_text(f"{checklist}\n▶ 建圖：{phase['phase']}{alive}")
+                self.stage_bar.show()
+                self.stage_bar.set_fraction(0.0)
+                self.stage_bar.set_text(f"{phase['phase']}…{alive}")
+                self.stage_bar.pulse()
+                return
+            self.stage_label.set_text(f"{checklist}\n▶ 建圖：{phase['phase']}{alive}")
+            self.stage_bar.show()
+            if info["percent"] is not None and info["total"]:
+                self.stage_bar.set_fraction(info["done"] / info["total"])
+                current = jobs.STAGES[stage][1] if stage is not None else ""
+                text = f"{current} {info['done']}/{info['total']} · {phase['phase']}"
+                if info["remaining"]:
+                    text += f"　約剩 {info['remaining']}"
+                self.stage_bar.set_text(text)
+            else:
+                self.stage_bar.set_fraction(0.0)
+                self.stage_bar.set_text(f"{phase['phase']}…{alive}")
+                self.stage_bar.pulse()
+            return
+        self.stage_label.set_text(checklist)
         self.stage_bar.show()
         if info["percent"] is not None and info["total"]:
             self.stage_bar.set_fraction(info["done"] / info["total"])
@@ -1174,6 +1208,14 @@ class App(Gtk.Window):
             text = f"{current} {info['done']}/{info['total']}"
             if info["remaining"]:
                 text += f"　約剩 {info['remaining']}"
+            # Guard the known stall: track-concat hits 100% but BA still runs.
+            if stage == 2 and info["percent"] == 100 and engine_age is not None and engine_age < 300:
+                text = f"{current} 匹配 100% → BA 運算中（無進度條，日誌 {int(engine_age)} 秒前更新）"
+                self.stage_bar.set_fraction(0.0)
+                self.stage_bar.set_text(text)
+                self.stage_bar.pulse()
+                self.stage_label.set_text(f"{checklist}\n▶ 建圖：BA 運算中（匹配已 100%，這段沒有進度條）")
+                return
             self.stage_bar.set_text(text)
         else:
             current = jobs.STAGES[stage][1] if stage is not None else "準備中"
@@ -1226,6 +1268,7 @@ class App(Gtk.Window):
         ply = jobs.map_pointcloud(job) if job["status"] == "done" else None
         if ply is None:
             self.viewer_frame.hide()
+            self.connect_warn.hide()
             self.viewer_info = {}
             self.viewer_source = ""
             self.viewer_path = None
@@ -1235,6 +1278,7 @@ class App(Gtk.Window):
                 self.viewer_source = f"定位用地圖（{ply.name}）"
             except (OSError, ValueError) as error:
                 self.viewer_frame.hide()
+                self.connect_warn.hide()
                 self.viewer_info = {}
                 self.viewer_label.set_text(f"3D 檢視載入失敗：{error}")
                 return
@@ -1260,6 +1304,15 @@ class App(Gtk.Window):
             approved and self.approved_engine == "original"
             and not jobs.delivery_archive(self.approved_dir).is_file()
         )
+        conn = jobs.map_connectivity(self.approved_dir)
+        if conn is not None and not conn["connected"] and len(conn["components"]) > 1:
+            names = "、".join(sorted({v["source"] for v in conn["videos"].values()}))
+            self.connect_warn.set_text(
+                f"⚠ 這張圖有 {len(conn['components'])} 個不相連的區塊（{names}）：各影片內部都完整，"
+                f"但影片之間沒有共視點，不共用座標系。跨區巡航會斷；確認前請先決定當多張圖用，或補拍交界重疊再重建。")
+            self.connect_warn.show()
+        else:
+            self.connect_warn.hide()
 
     def approve_current_map(self, _button=None) -> None:
         if not self.approved_dir:
@@ -1303,6 +1356,7 @@ class App(Gtk.Window):
     def show_result(self, job: dict | None) -> None:
         self.plot_points = []
         self.transfer_hint.hide()
+        self.connect_warn.hide()
         if job is None or job["kind"] != "map":
             self.approved_dir = None
             self.approved_engine = ""

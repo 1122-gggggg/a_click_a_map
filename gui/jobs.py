@@ -214,6 +214,18 @@ _TQDM = re.compile(r"(\d+)%\|[^\r\n]*? (\d+)/(\d+) \[([0-9:.]+)<([0-9:.]+)")
 _STAGE_MARK = re.compile(r"\[([0-4])/4\]")
 _DENSE_MARK = re.compile(r"===\s*densification", re.IGNORECASE)
 _ETA_HINT = re.compile(r"~([0-9.]+ h)")
+_REFINE = re.compile(r"Refinement iteration (\d+)/(\d+)")
+_BA_ROUND = re.compile(r"=== Iteration (\d+)/(\d+) ===")
+_BA_START = re.compile(r"Starting iterative BA with")
+_TRIANGULATED = re.compile(r"triangulate_points produced")
+_CERES_DONE = re.compile(r"Ceres Solver Report")
+_TRACKS_DONE = re.compile(r"Established (\d+) tracks from (\d+) observations")
+_CONCAT = re.compile(r"Concatenating tracks")
+_CORR = re.compile(r"Constructing correspondences")
+_DICT = re.compile(r"Adding points to dictionary")
+_PROF = re.compile(r"\[Profiling\] Iteration")
+_RETRI = re.compile(r"Retriangulation and Global bundle adjustment")
+_TRI_IMG = re.compile(r"Triangulating image #(\d+)")
 
 
 def parse_progress(log_text: str) -> dict:
@@ -238,6 +250,78 @@ def parse_progress(log_text: str) -> dict:
         estimate = hint.group(1)
     return {"stage": stage, "percent": percent, "done": done, "total": total,
             "elapsed": elapsed, "remaining": remaining, "estimate": estimate}
+
+def engine_log_path(job: dict) -> Path | None:
+    """Engine-side mapping.log for a map job (None when not created yet)."""
+    try:
+        cand = Path(job.get("result_dir", "")).expanduser() / "acam" / "logs" / "mapping.log"
+    except (TypeError, ValueError):
+        return None
+    return cand if cand.is_file() else None
+
+
+def read_engine_log_tail(job: dict, size: int = 200000) -> tuple[str, float | None]:
+    """Last `size` bytes of mapping.log plus log age in seconds (None when missing)."""
+    path = engine_log_path(job)
+    if path is None:
+        return "", None
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - size))
+            text = stream.read().decode("utf-8", "replace")
+        return text, time.time() - path.stat().st_mtime
+    except OSError:
+        return "", None
+
+
+def parse_mapping_phase(text: str) -> dict:
+    """Human-readable sub-stage inside [2/4] mapping (pure function).
+
+    The job log's tqdm bar freezes at 226/226 100% once track concatenation
+    finishes, while Ceres BA runs for minutes with no new tqdm line. This
+    reads mapping.log so the GUI can say "BA running" instead of looking stuck.
+    """
+    if not text:
+        return {"phase": None, "in_ba": False}
+    refines = _REFINE.findall(text)
+    rounds = _BA_ROUND.findall(text)
+    order: list[tuple[int, str]] = []
+    for rx, name in ((_DICT, "dict"), (_CORR, "corr"), (_CONCAT, "concat"),
+                     (_TRACKS_DONE, "tracks"), (_REFINE, "refine"),
+                     (_TRIANGULATED, "tri"), (_BA_START, "ba"),
+                     (_BA_ROUND, "round"), (_CERES_DONE, "ceres"), (_PROF, "prof"),
+                     (_TRI_IMG, "tri_img"), (_RETRI, "retri")):
+        found = list(rx.finditer(text))
+        if found:
+            order.append((found[-1].start(), name))
+    last = max(order)[1] if order else ""
+    refine = f"{refines[-1][0]}/{refines[-1][1]}" if refines else None
+    rnd = f"{rounds[-1][0]}/{rounds[-1][1]}" if rounds else None
+    if last in ("ba", "round", "ceres") and refine:
+        phase = f"全域優化 {refine} · BA 第 {rnd} 輪運算中" if rnd else f"全域優化 {refine} · BA 運算中"
+        return {"phase": phase, "in_ba": True}
+    if last in ("retri", "tri_img"):
+        imgs = _TRI_IMG.findall(text)
+        where = f"（看到第 {imgs[-1]} 張）" if imgs else ""
+        base = f"全域優化 {refine} · 重三角測量＋全域平差（C++ 運算中，無進度條）" if refine else "重三角測量＋全域平差中"
+        return {"phase": base + where, "in_ba": True}
+    if last == "tri":
+        return {"phase": f"全域優化 {refine} · 三角測量" if refine else "三角測量中", "in_ba": False}
+    if last == "refine":
+        return {"phase": f"全域優化 {refine} 開始" if refine else "全域優化中", "in_ba": False}
+    if last == "prof":
+        return {"phase": f"全域優化 {refine} 本輪完成" if refine else "本輪優化完成", "in_ba": False}
+    if last == "tracks":
+        m = _TRACKS_DONE.findall(text)[-1]
+        return {"phase": f"軌跡建立完成（{m[0]} 條／{m[1]} 觀測），進全域優化", "in_ba": False}
+    if last == "concat":
+        return {"phase": "串接軌跡中（這條 100% 之後還有 BA，別被騙）", "in_ba": False}
+    if last == "corr":
+        return {"phase": "建立對應中", "in_ba": False}
+    if last == "dict":
+        return {"phase": "建立點字典中", "in_ba": False}
+    return {"phase": None, "in_ba": False}
 
 
 def read_log_tail(job_id: str, size: int = 50000) -> str:
@@ -804,6 +888,28 @@ def map_result(job: dict) -> list[dict]:
             size = path.stat().st_size if path.is_file() else sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
             rows.append({"label": label, "path": str(path), "size": human(size)})
     return rows
+
+def map_connectivity(result_dir: str | Path) -> dict | None:
+    """Cross-video connectivity from map_report.json (None when not written yet).
+
+    A map can register 226/226 images yet split into disconnected components
+    (each video its own coordinate frame). The GUI must surface this before
+    the operator approves the map for cruise, otherwise cross-video routes
+    silently break. Pure function of the report file.
+    """
+    try:
+        report = json.loads((Path(result_dir).expanduser() / "map_report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    videos = report.get("videos", {})
+    if not videos:
+        return None
+    return {"connected": bool(report.get("connected", True)),
+            "images_registered": report.get("images_registered"),
+            "images_total": report.get("images_total"),
+            "components": report.get("video_components", []),
+            "videos": {vid: {"source": v.get("source", vid), "keyframes": v.get("keyframes"),
+                            "registered": v.get("registered")} for vid, v in videos.items()}}
 
 
 def cruise_result(job: dict) -> dict | None:

@@ -258,3 +258,30 @@ def test_parse_progress_densification_stage() -> None:
     assert jobs.parse_progress(log)["stage"] == 3
     log2 = "[2/4] mapping\n=== densification (MVSFormer++) ===\n[3/4] report\n"
     assert jobs.parse_progress(log2)["stage"] == 4
+
+
+def test_map_connectivity_split_warns(tmp_path) -> None:
+    import json
+    report = {"images_registered": 226, "images_total": 226, "connected": False,
+              "video_components": [["a"], ["b"]],
+              "videos": {"a": {"source": "P1.MP4", "keyframes": 96, "registered": 96},
+                         "b": {"source": "P2.MP4", "keyframes": 130, "registered": 130}}}
+    (tmp_path / "map_report.json").write_text(json.dumps(report))
+    conn = jobs.map_connectivity(tmp_path)
+    assert conn is not None and not conn["connected"] and len(conn["components"]) == 2
+    assert conn["images_registered"] == 226
+    report["connected"] = True
+    report["video_components"] = [["a", "b"]]
+    (tmp_path / "map_report.json").write_text(json.dumps(report))
+    assert jobs.map_connectivity(tmp_path)["connected"]
+    assert jobs.map_connectivity(tmp_path / "missing") is None
+
+
+def test_parse_mapping_phase_ba_and_retri() -> None:
+    ba = "Refinement iteration 2/2\n=== Iteration 1/3 ===\nStarting iterative BA with 1 tracks\n"
+    info = jobs.parse_mapping_phase(ba)
+    assert info["in_ba"] and "BA" in info["phase"] and "2/2" in info["phase"]
+    retri = "Refinement iteration 2/2\nRetriangulation and Global bundle adjustment\nTriangulating image #226 (225)\n"
+    info = jobs.parse_mapping_phase(retri)
+    assert info["in_ba"] and "226" in info["phase"]
+    assert jobs.parse_mapping_phase("") == {"phase": None, "in_ba": False}
