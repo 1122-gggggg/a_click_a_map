@@ -610,7 +610,7 @@ class App(Gtk.Window):
         top.pack_end(self.stop_button, False, False, 0)
         box.pack_start(top, False, False, 4)
 
-        box.pack_start(css_label("結果（完成後出現在這裡；建圖先在 3D 檢視確認，檔名點兩下可直接開啟）", "step"), False, False, 0)
+        box.pack_start(css_label("結果（完成後出現在這裡；點雲檔點兩下直接在上方 3D 檢視開啟，其他檔名點兩下用外部程式開啟）", "step"), False, False, 0)
         self.result_stack = Gtk.Stack()
         self.result_hint = css_label("任務完成後顯示結果", "hint")
         self.result_stack.add_named(self.result_hint, "hint")
@@ -653,6 +653,7 @@ class App(Gtk.Window):
         self.result_stack.add_named(map_page, "files")
         self.approved_dir = None
         self.viewer_info = {}
+        self.viewer_source = ""
         cruise = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.cruise_summary = Gtk.Label(xalign=0)
         self.coverage_bar = Gtk.ProgressBar(show_text=True)
@@ -881,8 +882,25 @@ class App(Gtk.Window):
     def open_result_row(self, view: Gtk.TreeView, path: Gtk.TreePath, _column) -> None:
         row = self.file_store[path]
         target = row[1]
-        if target and Path(target).exists():
-            subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not target or not Path(target).exists():
+            return
+        if target.lower().endswith(".ply"):
+            self.view_result_cloud(row[0], Path(target))
+            return
+        subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def view_result_cloud(self, label: str, path: Path) -> None:
+        """Double-clicked a point cloud row: inspect it in the built-in 3D viewer."""
+        try:
+            self.viewer_info = self.viewer.load(path)
+        except (OSError, ValueError) as error:
+            self.viewer_label.set_text(f"3D 檢視載入失敗（{path.name}）：{error}，改用外部程式開啟")
+            subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        self.viewer_source = f"{label}（{path.name}）"
+        self.viewer_frame.show_all()
+        self.update_viewer_label()
+        self.refresh_approval_ui()
 
     def on_close(self, *_args) -> bool:
         if jobs.running_count():
@@ -1025,7 +1043,10 @@ class App(Gtk.Window):
             self.show_result(job)
 
     def update_viewer_label(self) -> None:
-        self.viewer_label.set_text(self.viewer.describe())
+        text = self.viewer.describe()
+        if getattr(self, "viewer_source", ""):
+            text = f"【{self.viewer_source}】" + text
+        self.viewer_label.set_text(text)
 
     def load_map_viewer(self, job: dict) -> None:
         """Show the 3D inspection + approval bar for a finished map job."""
@@ -1034,9 +1055,11 @@ class App(Gtk.Window):
         if ply is None:
             self.viewer_frame.hide()
             self.viewer_info = {}
+            self.viewer_source = ""
         else:
             try:
                 self.viewer_info = self.viewer.load(ply)
+                self.viewer_source = f"定位用地圖（{ply.name}）"
             except (OSError, ValueError) as error:
                 self.viewer_frame.hide()
                 self.viewer_info = {}
@@ -1066,6 +1089,7 @@ class App(Gtk.Window):
             return
         try:
             info = dict(self.viewer_info)
+            info["cloud"] = getattr(self, "viewer_source", "")
             jobs.approve_map(self.approved_dir, info)
         except OSError as error:
             self.error(f"寫入確認紀錄失敗：{error}")

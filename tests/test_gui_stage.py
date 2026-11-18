@@ -122,3 +122,34 @@ def test_resume_request_rebuilds_submit() -> None:
     req = jobs.resume_request(job)
     assert req["kind"] == "map" and req["engine"] == "original"
     assert req["videos"] == ["a"] and req["name"] == "n"
+
+
+def _write_ply(path: Path, binary: bool, n: int = 5) -> None:
+    import numpy as np
+    xyz = np.arange(n * 3, dtype=np.float64).reshape(n, 3)
+    rgb = (np.arange(n * 3, dtype=np.uint8).reshape(n, 3) * 8)
+    header = ("ply\n" + ("format binary_little_endian 1.0\n" if binary else "format ascii 1.0\n")
+              + f"element vertex {n}\nproperty float x\nproperty float y\nproperty float z\n"
+                "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+    if binary:
+        import numpy as _np
+        dt = [("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")]
+        raw = _np.zeros(n, dtype=dt)
+        raw["x"], raw["y"], raw["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        raw["red"], raw["green"], raw["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        path.write_bytes(header.encode() + raw.tobytes())
+    else:
+        lines = [header] + [f"{x} {y} {z} {r} {g} {b}\n" for (x, y, z), (r, g, b) in zip(xyz.tolist(), rgb.tolist())]
+        path.write_text("".join(lines))
+
+
+def test_read_ply_points_binary_and_ascii(tmp_path: Path) -> None:
+    import sys
+    sys.path.insert(0, str(Path("gui").resolve()))
+    import app as gui_app
+    for binary in (True, False):
+        p = tmp_path / ("b.ply" if binary else ("a.ply"))
+        _write_ply(p, binary)
+        xyz, rgb, total = gui_app.read_ply_points(p)
+        assert total == 5 and xyz.shape == (5, 3) and rgb.shape == (5, 3)
+        assert abs(xyz[4, 0] - 12.0) < 1e-6 and rgb.dtype.name == "uint8"
