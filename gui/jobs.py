@@ -755,6 +755,35 @@ def resume_request(job: dict) -> dict:
     request["_resume"] = True  # same out/name on purpose: continue from stage caches
     return request
 
+def resume_plan(job: dict) -> list[tuple[str, str]]:
+    """What a 續跑 will skip vs redo, from the artifacts on disk.
+
+    Returns [(stage, action)] with action in ("skip", "reuse", "redo").
+    Mirrors the engine's own resume checks (receipts, validated caches,
+    finished model) so the operator knows before pressing resume how much
+    compute is saved. Post-star matching/BA have no checkpoint upstream and
+    always redo — that is stated, not hidden.
+    """
+    if job.get("kind") != "map":
+        return [("巡航定位", "redo")]
+    base = Path(job.get("result_dir", "")).expanduser()
+    plan: list[tuple[str, str]] = []
+    plan.append(("前處理 keyframes", "skip" if (base / "run/receipts/direct_preprocessing.json").is_file() else "redo"))
+    glues = sorted((base / "workspace").glob("work_*/gluemap")) if (base / "workspace").is_dir() else []
+    glue = glues[-1] if glues else None
+    twoview = glue is not None and (glue / "twoview_result.pth").is_file() and (glue / "twoview_result.pth").stat().st_size > 0
+    star = glue is not None and (glue / "star_result.pth").is_file() and (glue / "star_result.pth").stat().st_size > 0
+    sift = glue is not None and (glue / "database_sift.db").is_file() and (glue / "database_sift.db").stat().st_size > 0
+    plan.append(("雙視角幾何快取", "reuse" if twoview else "redo"))
+    plan.append(("特徵/配對快取", "reuse" if star else "redo"))
+    plan.append(("SIFT 資料庫", "reuse" if sift else "redo"))
+    model = base / "run/artifacts/mapping/edm/model"
+    done_model = model.is_dir() and (model / "images.bin").is_file() and (model / "points3D.bin").is_file()
+    plan.append(("GlueMap 匹配＋BA", "skip" if done_model else "redo"))
+    dense = (base / "run/products/map/dense/dense_receipt.json").is_file() and (base / "run/products/map/dense/dense.ply").is_file()
+    plan.append(("稠密點雲", "skip" if dense else "redo"))
+    return plan
+
 
 # ------------------------------------------------------------------------------------------------ running
 def _run(job: dict, cmd: list[str] | str) -> None:

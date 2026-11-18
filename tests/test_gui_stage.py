@@ -373,3 +373,29 @@ def test_phase_remaining_ba_uses_previous_round() -> None:
     assert info["elapsed_s"] == pytest.approx(40.0, abs=1.0)
     # round 1 took ~88s, 40s into round 2 -> ~48s left
     assert info["remaining_s"] == pytest.approx(88.0 - 40.0, abs=2.0)
+
+
+def test_resume_plan_reports_skip_vs_redo(tmp_path) -> None:
+    base = tmp_path / "site"
+    job = {"kind": "map", "result_dir": str(base)}
+    actions = dict(jobs.resume_plan(job))
+    assert actions["前處理 keyframes"] == "redo"
+    assert actions["GlueMap 匹配＋BA"] == "redo"
+    (base / "run/receipts").mkdir(parents=True)
+    (base / "run/receipts/direct_preprocessing.json").write_text("{}")
+    glue = base / "workspace/work_x/gluemap"
+    glue.mkdir(parents=True)
+    (glue / "twoview_result.pth").write_bytes(b"x")
+    (glue / "star_result.pth").write_bytes(b"x")
+    (glue / "database_sift.db").write_bytes(b"x" * 100)
+    actions = dict(jobs.resume_plan(job))
+    assert actions["前處理 keyframes"] == "skip"
+    assert actions["雙視角幾何快取"] == "reuse"
+    assert actions["SIFT 資料庫"] == "reuse"
+    assert actions["GlueMap 匹配＋BA"] == "redo"
+    model = base / "run/artifacts/mapping/edm/model"
+    model.mkdir(parents=True)
+    (model / "images.bin").write_bytes(b"x")
+    (model / "points3D.bin").write_bytes(b"x")
+    assert dict(jobs.resume_plan(job))["GlueMap 匹配＋BA"] == "skip"
+    assert jobs.resume_plan({"kind": "cruise"}) == [("巡航定位", "redo")]

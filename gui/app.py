@@ -1257,6 +1257,10 @@ class App(Gtk.Window):
         self.update_stage(job)
         self.stop_button.set_sensitive(job["status"] == "running")
         self.resume_button.set_sensitive(job["status"] in ("failed", "stopped", "interrupted"))
+        if job["status"] in ("failed", "stopped", "interrupted") and job.get("kind") == "map":
+            marks = {"skip": "跳過", "reuse": "續用", "redo": "重算"}
+            preview = "；".join(f"{stage}{marks[action]}" for stage, action in jobs.resume_plan(job))
+            self.resume_button.set_tooltip_text(f"續跑：同設定、同目錄從最近進度接續。{preview}")
         self.delete_button.set_sensitive(job["status"] in ("done", "failed", "stopped", "interrupted"))
         self.open_button.set_sensitive(Path(job.get("result_dir", "")).exists())
         chunk, self.log_offset = jobs.read_log(job["id"], self.log_offset)
