@@ -618,12 +618,17 @@ class App(Gtk.Window):
         self.resume_button.set_tooltip_text("用同樣的設定再跑一次；建圖會從已完成的階段接續，不會重做")
         self.resume_button.set_sensitive(False)
         self.resume_button.connect("clicked", self.resume_selected)
+        self.delete_button = Gtk.Button(label="刪除任務")
+        self.delete_button.set_tooltip_text("清除這筆任務的紀錄與暫存（建好的地圖檔案會保留）")
+        self.delete_button.set_sensitive(False)
+        self.delete_button.connect("clicked", self.confirm_delete)
         self.open_button = Gtk.Button(label="開啟資料夾")
         self.open_button.set_tooltip_text("用檔案總管打開結果資料夾")
         self.open_button.set_sensitive(False)
         self.open_button.connect("clicked", self.open_folder)
         top.pack_end(self.open_button, False, False, 0)
         top.pack_end(self.resume_button, False, False, 0)
+        top.pack_end(self.delete_button, False, False, 0)
         top.pack_end(self.stop_button, False, False, 0)
         box.pack_start(top, False, False, 4)
 
@@ -881,6 +886,45 @@ class App(Gtk.Window):
             return
         self.submit(jobs.resume_request(job))
 
+    def confirm_delete(self, _button=None) -> None:
+        if not self.selected:
+            return
+        try:
+            job = jobs.read_job(self.selected)
+        except (OSError, ValueError):
+            return
+        if job.get("status") not in ("done", "failed", "stopped", "interrupted"):
+            return
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.YES_NO,
+                                   text=f"確定要刪除「{job.get('name', '')}」這筆任務嗎？\n"
+                                        "會清除它的紀錄與暫存檔；建好的地圖檔案會保留，不會動。")
+        answer = dialog.run()
+        dialog.destroy()
+        if answer != Gtk.ResponseType.YES:
+            return
+        try:
+            jobs.delete_job(self.selected)
+        except (OSError, ValueError) as error:
+            self.error(str(error))
+            return
+        self.selected = None
+        self.log_offset = 0
+        self.shown = None
+        self.log.get_buffer().set_text("")
+        self.show_result(None)
+        self.title_label.set_text("還沒選任務：在左邊開始一個，或點上面的任務列表")
+        self.status_label.set_text("")
+        self.elapsed_label.set_text("")
+        self.stage_label.set_text("")
+        self.stage_bar.hide()
+        self.path_label.set_text("")
+        self.stop_button.set_sensitive(False)
+        self.resume_button.set_sensitive(False)
+        self.delete_button.set_sensitive(False)
+        self.open_button.set_sensitive(False)
+        self.tick()
+
     def confirm_stop(self, _button=None) -> None:
         if not self.selected:
             return
@@ -1093,6 +1137,7 @@ class App(Gtk.Window):
         self.update_stage(job)
         self.stop_button.set_sensitive(job["status"] == "running")
         self.resume_button.set_sensitive(job["status"] in ("failed", "stopped", "interrupted"))
+        self.delete_button.set_sensitive(job["status"] in ("done", "failed", "stopped", "interrupted"))
         self.open_button.set_sensitive(Path(job.get("result_dir", "")).exists())
         chunk, self.log_offset = jobs.read_log(job["id"], self.log_offset)
         if chunk:

@@ -1,6 +1,7 @@
 """Single-instance lock for the desktop app (no display needed)."""
 from __future__ import annotations
 
+import pytest
 import json
 import os
 import sys
@@ -83,3 +84,21 @@ def test_kill_tree_reaps_escaped_grandchildren() -> None:
             parent.kill()
         except OSError:
             pass
+
+
+def test_delete_job_removes_record_but_requires_finished(tmp_path, monkeypatch) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gui"))
+    import jobs
+    monkeypatch.setattr(jobs, "JOBS", tmp_path / "jobs")
+    with pytest.raises((OSError, ValueError)):
+        jobs.delete_job("nosuchid")
+    d = jobs.job_dir("abc123")
+    d.mkdir(parents=True)
+    (d / "job.json").write_text('{"id": "abc123", "status": "running"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="停止"):
+        jobs.delete_job("abc123")
+    assert d.exists()
+    (d / "job.json").write_text('{"id": "abc123", "status": "failed"}', encoding="utf-8")
+    jobs.delete_job("abc123")
+    assert not d.exists()

@@ -726,6 +726,19 @@ def stop_job(job_id: str) -> None:
     _kill_tree(proc.pid)
 
 
+def delete_job(job_id: str) -> None:
+    """Delete a finished job's record, logs and staged files (not the map output).
+
+    Only for jobs that are done/failed/stopped/interrupted: running jobs must
+    be stopped first. The built map under the output dir is kept; remove it
+    with a file manager if the disk space is needed.
+    """
+    job = read_job(job_id)
+    if job.get("status") not in ("done", "failed", "stopped", "interrupted"):
+        raise ValueError("執行中的任務請先按「停止」，不能直接刪除")
+    shutil.rmtree(job_dir(job_id), ignore_errors=True)
+
+
 def stop_all() -> int:
     with LOCK:
         ids = list(PROCS)
