@@ -748,11 +748,11 @@ class App(Gtk.Window):
                 radio.set_active(key == self.engine)
         original = self.engine == "original"
         if hasattr(self, "engine_hint"):
-            self.engine_hint.set_text("原始版：建圖一次只吃一個資料夾；巡航要另外給查詢影片" if original
+            self.engine_hint.set_text("原始版：一次一批（同批需同長寬比），輸出轉接包；巡航要另外給查詢影片" if original
                                       else "MoGe-3 版：可一次加入多個資料夾或影片檔")
-        # 原始版建圖只吃資料夾：與其等按下去才報錯，不如直接不讓你選檔案
-        self.add_files_button.set_sensitive(not original)
-        self.video_hint.set_text("原始版：只能加入「一個」影片資料夾，多選檔案沒用" if original else "可加入多個資料夾或影片檔，會自動找出裡面的影片")
+        # 兩個版本都能隨意混搭資料夾與單檔；原始版會在開始時自動拼成一個資料夾
+        self.add_files_button.set_sensitive(True)
+        self.video_hint.set_text("可混搭多個資料夾與影片檔，會自動找出裡面的影片" + ("（同批需同長寬比）" if original else ""))
         self.skip_dense.set_sensitive(not original)
         self.map_pick_hint.set_text(("原始版：選含 run/ 的資料夾" if original else "MoGe-3 版：選含 localization/bundle 的資料夾")
                                     + "；巡航前需先在建圖結果按「✓ 確認地圖可用」")

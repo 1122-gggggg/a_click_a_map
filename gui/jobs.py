@@ -12,6 +12,7 @@ import os
 import shlex
 import signal
 import subprocess
+import shutil
 import threading
 import time
 import uuid
@@ -143,6 +144,32 @@ def read_log(job_id: str, offset: int) -> tuple[str, int]:
 
 
 # ------------------------------------------------------------------------------------------------ commands
+def stage_selection(videos: list[Path], dest: Path) -> Path:
+    """Hard-link the user's hand-picked videos into one folder for the original engine.
+
+    The original entry point only accepts a single video folder, so free
+    file/folder picking is staged here (names preserved, collisions suffixed
+    with _2, _3, ...). Hard links, never symlinks: the engine refuses those.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    used: set[str] = set()
+    for video in videos:
+        base = safe_name(video.stem, "video")
+        cand = f"{base}{video.suffix}"
+        index = 2
+        while cand in used:
+            cand = f"{base}_{index}{video.suffix}"
+            index += 1
+        used.add(cand)
+        target = dest / cand
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        try:
+            os.link(video, target)
+        except OSError:
+            shutil.copy2(video, target)  # cross-device fallback
+    return dest
+
 def expand_videos(entries: list[str]) -> list[Path]:
     found: list[Path] = []
     for entry in entries:
@@ -179,9 +206,11 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
     if intrinsics and not Path(intrinsics).expanduser().is_file():
         return False, f"找不到標定檔：{intrinsics}"
     if engine == "original":
-        if len(entries) != 1 or not Path(entries[0]).expanduser().is_dir():
-            return False, "原始版一次只吃「一個影片資料夾」：請只留一個資料夾"
-        return True, "就緒：按「開始建圖」"
+        try:
+            count = sum(1 for _ in expand_videos(entries))
+        except ValueError as error:
+            return False, str(error)
+        return True, f"就緒：共 {count} 部影片，按「開始建圖」（同批影片需同長寬比）"
     if engine == "moge3":
         try:
             count = sum(1 for _ in expand_videos(entries))
@@ -238,7 +267,7 @@ def validate_cruise_request(request: dict) -> tuple[bool, str]:
         return False, "這張地圖還沒檢查確認：先在建圖結果打開 3D 檢視，確認沒問題後按「✓ 確認地圖可用」"
     return True, "就緒：按「開始巡航定位」"
 
-def build_map_command(request: dict) -> tuple[list[str], dict]:
+def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
     engine = request["engine"]
     entries = [e.strip() for e in request.get("videos", []) if e.strip()]
     if not entries:
@@ -249,9 +278,12 @@ def build_map_command(request: dict) -> tuple[list[str], dict]:
     if intrinsics and not Path(intrinsics).expanduser().is_file():
         raise ValueError(f"找不到標定檔: {intrinsics}")
     if engine == "original":
-        if len(entries) != 1 or not Path(entries[0]).expanduser().is_dir():
-            raise ValueError("原始版一次只吃一個影片資料夾")
-        cmd = [str(REPO / "run.sh"), "map", str(Path(entries[0]).expanduser().resolve()), "--out", str(out), "--name", name]
+        videos = expand_videos(entries)
+        try:
+            staged = stage_selection(videos, job_dir(job_id) / "selection")
+        except OSError as error:
+            raise ValueError(f"準備影片失敗（硬碟空間或權限）：{error}")
+        cmd = [str(REPO / "run.sh"), "map", str(staged.resolve()), "--out", str(out), "--name", name]
         if intrinsics:
             cmd += ["--intrinsics", intrinsics]
         return cmd, {"name": name, "result_dir": str(out / name)}
@@ -333,7 +365,7 @@ def create_job(request: dict) -> dict:
     job_id = time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
     job_dir(job_id).mkdir(parents=True)
     try:
-        cmd, meta = build_map_command(request) if kind == "map" else build_cruise_command(request, job_id)
+        cmd, meta = build_map_command(request, job_id) if kind == "map" else build_cruise_command(request, job_id)
     except ValueError:
         job_dir(job_id).rmdir()
         raise
