@@ -21,12 +21,14 @@
 
 ## 從零開始（第一次拿到這份程式）
 
+Linux（Ubuntu 桌面）直接照打；**Windows 請先裝 WSL2＋Ubuntu 再在裡面做同樣的事**（程式放 WSL 家目錄，不支援原生 Windows，詳見工程人員安裝說明 §2、§3A）。
+
 ```bash
 git clone https://github.com/1122-gggggg/a_click_a_map && cd a_click_a_map
 ./scripts/setup.sh              # 原始版：釘住第三方程式＋套 patch＋下載權重（EDM 權重需自備，見下）
 moge3/scripts/setup.sh          # MoGe-3 版（另見 moge3/README.md）
 ./run.sh doctor                 # 全綠才算裝好
-./安裝桌面捷徑.sh                # 桌面出現「無人機自動建圖巡航系統」，之後雙擊即可
+./安裝桌面捷徑.sh                # 桌面出現「無人機自動建圖巡航系統」，之後雙擊即可（WSL：改跑 ./gui.sh）
 ```
 
 EDM 權重不會自動下載：把 `edm_outdoor.ckpt` 放到 `third_party/EDM/weights/`（或設 `ACAM_EDM_CHECKPOINT`）。
