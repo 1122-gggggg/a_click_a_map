@@ -7,7 +7,10 @@ Engines:
 """
 from __future__ import annotations
 
+import codecs
 import json
+import logging
+import math
 import numpy as np
 import re
 import os
@@ -19,17 +22,18 @@ import shutil
 import threading
 import time
 import uuid
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from acam.calibration import load_calibration  # noqa: E402
+from acam.cli import safe_name as _original_map_name  # noqa: E402
 
 BUILTIN_CAMERA_PROFILE = REPO / "configs/river_intrinsics_undistorted.json"
 JOBS = REPO / "acam_gui" / "jobs"
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mts"}
-LOCK = threading.Lock()
-PROCS: dict[str, subprocess.Popen] = {}
 VIEWER_MAX_POINTS = 60000
 
 
@@ -423,19 +427,54 @@ def list_jobs() -> list[dict]:
 
 
 def mark_interrupted() -> None:
-    """Jobs that were running when the app last closed cannot be resumed from here."""
+    """Record queued and running jobs left behind by the previous app process."""
     for job in list_jobs():
         if job.get("status") in ("running", "queued"):
             job["status"] = "interrupted"
+            job.pop("stop_requested", None)
             write_job(job)
 
 
-def read_log(job_id: str, offset: int) -> tuple[str, int]:
+_LOG_READ_BYTES = 64 * 1024
+
+
+def read_log(
+    job_id: str, offset: int | None, *, final: bool = False
+) -> tuple[str, int | None]:
+    """Read at most 64 KiB and return the byte offset of the next unread data.
+
+    None starts at the recent tail, as does an offset beyond a truncated log.
+    Incomplete UTF-8 stays unread unless final is set and this read reaches EOF.
+    A missing log leaves the offset unchanged.
+    """
     path = job_dir(job_id) / "log.txt"
-    if not path.exists():
+    try:
+        with path.open("rb", buffering=0) as stream:
+            end = stream.seek(0, os.SEEK_END)
+            if offset is None or offset > end:
+                start = max(0, end - _LOG_READ_BYTES)
+                align_tail = start > 0
+            else:
+                start = offset
+                align_tail = False
+            if start == end:
+                return "", start
+            stream.seek(start)
+            data = stream.read(min(_LOG_READ_BYTES, end - start))
+    except FileNotFoundError:
         return "", offset
-    data = path.read_bytes()
-    return data[offset:].decode("utf-8", "replace"), len(data)
+
+    if align_tail:
+        # The tail window may begin in the middle of a UTF-8 character.
+        skip = 0
+        while skip < min(3, len(data)) and data[skip] & 0xC0 == 0x80:
+            skip += 1
+        if skip:
+            start += skip
+            data = data[skip:]
+
+    text, consumed = codecs.utf_8_decode(data, "replace", final and start + len(data) == end)
+    return text, start + consumed
 
 
 # ------------------------------------------------------------------------------------------------ commands
@@ -578,7 +617,7 @@ def validate_map_request(request: dict) -> tuple[bool, str]:
         return False, "輸出位置不能空白"
     if engine not in ("original", "moge3"):
         return False, "未知的建圖方式"
-    taken = map_output_status(request.get("out"), request.get("name"))
+    taken = map_output_status(request.get("out"), _map_name(request.get("name"), engine))
     if taken:
         return False, taken
     try:
@@ -650,13 +689,24 @@ def validate_cruise_request(request: dict) -> tuple[bool, str]:
         return False, "這張地圖還沒檢查確認：先在建圖結果打開 3D 檢視，確認沒問題後按「✓ 確認地圖可用」"
     return True, "就緒：按「開始巡航定位」"
 
+def _map_name(raw: str | None, engine: str) -> str:
+    name = safe_name(raw or "site", "site")
+    # The original CLI applies an additional ASCII-only normalization.
+    return _original_map_name(name) if engine == "original" else name
+
+
+def _map_destination(request: dict) -> Path:
+    out = Path(request.get("out") or REPO / "acam_out").expanduser().resolve()
+    return out / _map_name(request.get("name"), request["engine"])
+
+
 def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
     engine = request["engine"]
     entries = [e.strip() for e in request.get("videos", []) if e.strip()]
     if not entries:
         raise ValueError("請加入影片")
-    name = safe_name(request.get("name") or "site", "site")
-    out = Path(request.get("out") or REPO / "acam_out").expanduser().resolve()
+    destination = _map_destination(request)
+    out, name = destination.parent, destination.name
     if not request.get("_resume"):
         taken = map_output_status(str(out), name)
         if taken:
@@ -665,7 +715,7 @@ def build_map_command(request: dict, job_id: str) -> tuple[list[str], dict]:
         raise ValueError("未知引擎")
     videos = expand_videos(entries)
     path = _camera_choice(request)
-    meta = {"name": name, "result_dir": str(out / name)}
+    meta = {"name": name, "result_dir": str(destination)}
     if path is not None:
         try:
             payload = load_calibration(path)
@@ -855,33 +905,124 @@ def resume_plan(job: dict) -> list[tuple[str, str]]:
 
 
 # ------------------------------------------------------------------------------------------------ running
-def _run(job: dict, cmd: list[str] | str) -> None:
-    directory = job_dir(job["id"])
+@dataclass
+class _QueueItem:
+    job: dict
+    cmd: list[str] | str
+    target: Path | None
+
+
+_QUEUE_CHANGED = threading.Condition()
+_SUBMIT_LOCK = threading.Lock()
+_waiting: deque[_QueueItem] = deque()
+_active: _QueueItem | None = None
+_worker: threading.Thread | None = None
+
+
+def _persist_status(job: dict) -> None:
+    try:
+        write_job(job)
+    except OSError:
+        # A disk failure must not prevent termination or hold the queue slot.
+        logging.getLogger(__name__).exception("Could not save desktop job %s", job["id"])
+
+
+def _finish_locked(item: _QueueItem, status: str, **fields) -> None:
+    global _active
+    item.job.pop("stop_requested", None)
+    item.job.update(status=status, finished=time.time(), **fields)
+    _persist_status(item.job)
+    if _active is item:
+        _active = None
+        _QUEUE_CHANGED.notify_all()
+
+
+def _run(item: _QueueItem) -> None:
+    job, cmd = item.job, item.cmd
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["PYTHONUNBUFFERED"] = "1"
     if job.get("engine_python"):
         env["ACAM_PYTHON"] = job["engine_python"]
-    log = (directory / "log.txt").open("ab", buffering=0)
-    log.write(("$ " + (cmd if isinstance(cmd, str) else " ".join(shlex.quote(c) for c in cmd)) + "\n").encode())
+    proc = None
     try:
-        proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), executable="/bin/bash" if isinstance(cmd, str) else None,
-                                stdout=log, stderr=subprocess.STDOUT, env=env, cwd=REPO, start_new_session=True)
-    except OSError as error:
-        job.update(status="failed", error=str(error), finished=time.time())
-        write_job(job)
+        with (job_dir(job["id"]) / "log.txt").open("ab", buffering=0) as log:
+            command = cmd if isinstance(cmd, str) else shlex.join(cmd)
+            log.write(f"$ {command}\n".encode())
+            with _QUEUE_CHANGED:
+                if job.get("stop_requested"):
+                    _finish_locked(item, "stopped")
+                    return
+            proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), executable="/bin/bash" if isinstance(cmd, str) else None,
+                                    stdout=log, stderr=subprocess.STDOUT, env=env, cwd=REPO, start_new_session=True)
+    except (OSError, ValueError) as error:
+        fields: dict[str, str | int] = {"error": str(error)}
+        if proc is not None:
+            _kill_tree(proc.pid)
+            fields["exit_code"] = proc.wait()
+        with _QUEUE_CHANGED:
+            _finish_locked(item, "stopped" if job.get("stop_requested") else "failed", **fields)
         return
-    with LOCK:
-        PROCS[job["id"]] = proc
-    job.update(status="running", pid=proc.pid)
-    write_job(job)
+
+    # The worker alone reaps subprocesses. Serialize the reap with stop
+    # requests, so tree termination never signals an already-reaped PID.
+    with _QUEUE_CHANGED:
+        job["pid"] = proc.pid
+        _persist_status(job)
+        while not job.get("stop_requested"):
+            code = proc.poll()
+            if code is not None:
+                _finish_locked(item, "done" if code == 0 else "failed", exit_code=code)
+                return
+            _QUEUE_CHANGED.wait(timeout=0.1)
+    _kill_tree(proc.pid)
     code = proc.wait()
-    with LOCK:
-        PROCS.pop(job["id"], None)
-    job = read_job(job["id"])
-    if job.get("status") != "stopped":
-        job["status"] = "done" if code == 0 else "failed"
-    job.update(exit_code=code, finished=time.time())
-    write_job(job)
+    with _QUEUE_CHANGED:
+        _finish_locked(item, "stopped", exit_code=code)
+
+
+def _run_queue() -> None:
+    global _active
+    while True:
+        with _QUEUE_CHANGED:
+            _QUEUE_CHANGED.wait_for(lambda: _waiting)
+            item = _active = _waiting.popleft()
+            item.job["status"] = "running"
+            try:
+                write_job(item.job)
+            except OSError as error:
+                _finish_locked(item, "failed", error=str(error))
+                continue
+        _run(item)
+
+
+def _requested_target(kind: str, request: dict) -> Path | None:
+    if kind == "map":
+        return _map_destination(request).resolve()
+    if kind == "export":
+        return delivery_archive(request["map"]).resolve()
+    if kind == "pack":
+        return Path(request["map"]).expanduser().resolve()
+    return None
+
+
+def _require_free_target_locked(target: Path | None) -> None:
+    if target is not None and (
+        (_active is not None and _active.target == target) or any(item.target == target for item in _waiting)
+    ):
+        raise ValueError(f"輸出位置已有排隊或執行中的任務：{target}")
+
+
+def _enqueue(item: _QueueItem) -> None:
+    global _worker
+    with _QUEUE_CHANGED:
+        _require_free_target_locked(item.target)
+        write_job(item.job)
+        if _worker is None:
+            worker = threading.Thread(target=_run_queue, name="desktop-job-queue", daemon=True)
+            worker.start()
+            _worker = worker
+        _waiting.append(item)
+        _QUEUE_CHANGED.notify_all()
 
 
 def create_job(request: dict) -> dict:
@@ -893,42 +1034,41 @@ def create_job(request: dict) -> dict:
     status = engine_status()[engine]
     if not status["ready"]:
         raise ValueError("此引擎尚未安裝：" + status["hint"])
-    job_id = time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
-    job_dir(job_id).mkdir(parents=True)
-    engine_python = find_engine_python()
-    if not engine_python:
-        job_dir(job_id).rmdir()
-        raise ValueError("找不到可跑引擎的 Python（需 torch＋CUDA、pycolmap、pygluemap）：先跑 setup，或設 ACAM_PYTHON 再重開程式")
-    try:
-        if kind == "map":
-            cmd, meta = build_map_command(request, job_id)
-        elif kind == "cruise":
-            cmd, meta = build_cruise_command(request, job_id)
-        elif kind == "export":
-            cmd, meta = _build_export_command(request["map"])
-        else:
-            cmd, meta = build_pack_command(request["map"], job_id)
-    except (OSError, ValueError):
-        shutil.rmtree(job_dir(job_id))
-        raise
-    job = {"id": job_id, "kind": kind, "engine": engine, "status": "queued", "created": time.time(), **meta,
-           "engine_python": engine_python,
-           "request": {k: v for k, v in request.items() if k in (
-               "videos", "out", "name", "intrinsics", "video", "map", "route", "dense",
-               "camera_profile", "camera_confirmed", "auto_calibrate")}}
-    write_job(job)
-    threading.Thread(target=_run, args=(job, cmd), daemon=True).start()
-    return job
 
-
-def _process_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Serialize preparations without holding the queue lock during a probe
+    # or video staging. Reject busy outputs before copying any inputs.
+    with _SUBMIT_LOCK:
+        target = _requested_target(kind, request)
+        with _QUEUE_CHANGED:
+            _require_free_target_locked(target)
+        engine_python = find_engine_python()
+        if not engine_python:
+            raise ValueError("找不到可跑引擎的 Python（需 torch＋CUDA、pycolmap、pygluemap）：先跑 setup，或設 ACAM_PYTHON 再重開程式")
+        job_id = time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
+        directory = job_dir(job_id)
+        directory.mkdir(parents=True)
+        try:
+            if kind == "map":
+                cmd, meta = build_map_command(request, job_id)
+            elif kind == "cruise":
+                cmd, meta = build_cruise_command(request, job_id)
+            elif kind == "export":
+                cmd, meta = _build_export_command(request["map"])
+            else:
+                cmd, meta = build_pack_command(request["map"], job_id)
+            job = {"id": job_id, "kind": kind, "engine": engine, "status": "queued", "created": time.time(), **meta,
+                   "engine_python": engine_python,
+                   "request": {k: v for k, v in request.items() if k in (
+                       "videos", "out", "name", "intrinsics", "video", "map", "route", "dense",
+                       "camera_profile", "camera_confirmed", "auto_calibrate")}}
+            # Use the command's actual destination for the reservation.
+            if target is not None:
+                target = Path(meta["result_dir"]).resolve()
+            _enqueue(_QueueItem(job.copy(), cmd, target))
+        except Exception:
+            shutil.rmtree(directory)
+            raise
+        return job
 
 
 def _descendants(pid: int) -> list[int]:
@@ -962,7 +1102,7 @@ def _descendants(pid: int) -> list[int]:
 def _proc_state(pid: int) -> str | None:
     """Process state from /proc, or None if reaped already (Z counts as dead)."""
     try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[2]
+        return Path(f"/proc/{pid}/stat").read_text(errors="replace").rsplit(")", 1)[1].split(maxsplit=1)[0]
     except (OSError, IndexError):
         return None
 
@@ -984,29 +1124,48 @@ def _kill_tree(pid: int, timeout: float = 10.0) -> None:
             os.kill(p, signal.SIGTERM)
         except OSError:
             pass
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if all(_proc_state(p) in (None, "Z") for p in targets if p != me):
+    deadline = time.monotonic() + timeout
+    while True:
+        targets = [p for p in targets if _proc_state(p) not in (None, "Z", "X")]
+        if not targets:
             return
-        time.sleep(0.5)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
     for p in targets:
-        if p == me:
-            continue
-        try:
-            os.kill(-p if p == pid else p, signal.SIGKILL)
-        except OSError:
-            pass
+        if p != pid:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    while targets:
+        targets = [p for p in targets if _proc_state(p) not in (None, "Z", "X")]
+        if targets:
+            time.sleep(0.1)
+
+
+def _request_stop_locked(item: _QueueItem) -> None:
+    if not item.job.get("stop_requested"):
+        item.job["stop_requested"] = True
+        _persist_status(item.job)
+        _QUEUE_CHANGED.notify_all()
 
 
 def stop_job(job_id: str) -> None:
-    with LOCK:
-        proc = PROCS.get(job_id)
-    if proc is None or proc.poll() is not None:
-        return
-    job = read_job(job_id)
-    job["status"] = "stopped"
-    write_job(job)
-    _kill_tree(proc.pid)
+    """Cancel a queued job or request asynchronous termination of a running one."""
+    with _QUEUE_CHANGED:
+        if _active is not None and _active.job["id"] == job_id:
+            _request_stop_locked(_active)
+            return
+        for idx, item in enumerate(_waiting):
+            if item.job["id"] == job_id:
+                del _waiting[idx]
+                _finish_locked(item, "stopped")
+                return
 
 
 def delete_job(job_id: str) -> None:
@@ -1023,16 +1182,28 @@ def delete_job(job_id: str) -> None:
 
 
 def stop_all() -> int:
-    with LOCK:
-        ids = list(PROCS)
-    for job_id in ids:
-        stop_job(job_id)
-    return len(ids)
+    """Cancel all waiting jobs, then stop and reap the active subprocess."""
+    with _QUEUE_CHANGED:
+        count = len(_waiting)
+        while _waiting:
+            _finish_locked(_waiting.popleft(), "stopped")
+        current = _active
+        if current is not None:
+            _request_stop_locked(current)
+            _QUEUE_CHANGED.wait_for(lambda: _active is not current)
+            count += 1
+        return count
 
 
 def running_count() -> int:
-    with LOCK:
-        return sum(1 for p in PROCS.values() if p.poll() is None)
+    with _QUEUE_CHANGED:
+        return int(_active is not None)
+
+
+def active_count() -> int:
+    """Count queued and running jobs, including any still terminating."""
+    with _QUEUE_CHANGED:
+        return len(_waiting) + int(_active is not None)
 
 
 # ------------------------------------------------------------------------------------------------ results
@@ -1100,11 +1271,30 @@ def cruise_result(job: dict) -> dict | None:
         return None
     folder = summaries[-1].parent
     summary = json.loads(summaries[-1].read_text(encoding="utf-8"))
-    points = []
+    frame_count = summary.get("dense_frames")
     frames = folder / "frames.jsonl"
-    if frames.exists():
-        rows = [json.loads(line) for line in frames.read_text(encoding="utf-8").splitlines() if line.strip()]
-        step = max(1, len(rows) // 2000)
-        points = [(r["position"], r["status"]) for r in rows[::step] if r.get("position")]
-    return {"frames": summary.get("dense_frames"), "coverage": summary.get("pose_coverage"),
+    points = []
+    if frames.is_file():
+        stride = max(1, ((frame_count or 0) + 1999) // 2000)
+        segment = 0
+        last_bucket = -1
+        last_pose = None
+        with frames.open(encoding="utf-8") as stream:
+            for index, line in enumerate(stream):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                position, status = row.get("position"), row["status"]
+                # Inspect even unsampled frames: a gap always splits the preview.
+                if status == "NO_POSE" or position is None or not all(math.isfinite(v) for v in position):
+                    segment += 1
+                    continue
+                last_pose = (position, status, segment)
+                bucket = index // stride
+                if bucket != last_bucket:
+                    points.append(last_pose)
+                    last_bucket = bucket
+        if last_pose is not None and last_pose is not points[-1]:
+            points.append(last_pose)
+    return {"frames": frame_count, "coverage": summary.get("pose_coverage"),
             "status_counts": summary.get("status_counts", {}), "points": points, "dir": str(folder)}
